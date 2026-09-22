@@ -1,0 +1,34 @@
+{
+  "name": "durable-workflow",
+  "version": "0.1.0",
+  "description": "Code-first durable workflows for Node: replay-based execution, memoized steps, durable retries and timers, pause/resume on signals, optimistic concurrency. Memory or Postgres store.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+    "./postgres": { "types": "./dist/stores/postgres.d.ts", "import": "./dist/stores/postgres.js" }
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:up": "docker compose up -d",
+    "prepublishOnly": "pnpm build"
+  },
+  "peerDependencies": { "pg": "^8.13.0" },
+  "peerDependenciesMeta": { "pg": { "optional": true } },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "pg": "^8.13.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.8"
+  },
+  "packageManager": "pnpm@9.4.0",
+  "license": "MIT",
+  "keywords": ["workflow", "durable-execution", "orchestration", "saga", "retry", "state-machine", "postgres"]
+}
