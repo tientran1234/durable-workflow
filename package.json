@@ -6,21 +6,40 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
-    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
-    "./postgres": { "types": "./dist/stores/postgres.d.ts", "import": "./dist/stores/postgres.js" }
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./postgres": {
+      "types": "./dist/stores/postgres.d.ts",
+      "import": "./dist/stores/postgres.js"
+    }
   },
-  "files": ["dist", "README.md", "LICENSE"],
-  "engines": { "node": ">=20" },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "db:up": "docker compose up -d",
-    "prepublishOnly": "pnpm build"
+    "prepublishOnly": "pnpm build",
+    "prepare": "tsc -p tsconfig.build.json"
   },
-  "peerDependencies": { "pg": "^8.13.0" },
-  "peerDependenciesMeta": { "pg": { "optional": true } },
+  "peerDependencies": {
+    "pg": "^8.13.0"
+  },
+  "peerDependenciesMeta": {
+    "pg": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/pg": "^8.11.10",
@@ -30,5 +49,13 @@
   },
   "packageManager": "pnpm@9.4.0",
   "license": "MIT",
-  "keywords": ["workflow", "durable-execution", "orchestration", "saga", "retry", "state-machine", "postgres"]
+  "keywords": [
+    "workflow",
+    "durable-execution",
+    "orchestration",
+    "saga",
+    "retry",
+    "state-machine",
+    "postgres"
+  ]
 }
