@@ -10,7 +10,8 @@ import {
   errorMessage,
 } from "./errors.js";
 import { DEFAULT_RETRY } from "./retry.js";
-import type { RetryPolicy, RunRecord, RunStore, WorkflowDefinition } from "./types.js";
+import type { RetryPolicy, RunPage, RunQuery, RunRecord, RunStore, WorkflowDefinition } from "./types.js";
+import { type RunView, renderRun } from "./view.js";
 
 export interface EngineOptions {
   store: RunStore;
@@ -77,6 +78,17 @@ export class Engine {
 
   get(id: string): Promise<RunRecord | null> {
     return this.store.get(id);
+  }
+
+  /** A page of runs, newest first. Pass the page's `cursor` back for the next one. */
+  list(query: RunQuery = {}): Promise<RunPage> {
+    return this.store.list(query);
+  }
+
+  /** The run as an admin screen wants it: what it is blocked on, history as a timeline. */
+  async view(id: string): Promise<RunView | null> {
+    const run = await this.store.get(id);
+    return run ? renderRun(run) : null;
   }
 
   /** One execution pass, if the run is due and unleased. Returns the run as persisted afterwards. */

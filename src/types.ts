@@ -77,6 +77,21 @@ export function defineWorkflow<Input, Output>(
   return { name, run };
 }
 
+export interface RunQuery {
+  workflow?: string;
+  status?: RunStatus;
+  /** Page size. Defaults to 50, capped at 500. */
+  limit?: number;
+  /** Opaque position from the previous page's `cursor`. */
+  cursor?: string;
+}
+
+export interface RunPage {
+  runs: RunRecord[];
+  /** Pass back as `cursor` for the next page, or null when this was the last one. */
+  cursor: string | null;
+}
+
 export interface RunStore {
   create(run: RunRecord): Promise<void>;
   get(id: string): Promise<RunRecord | null>;
@@ -90,4 +105,10 @@ export interface RunStore {
    * another worker. Leased runs come back with `leaseUntil` and `version` updated.
    */
   claimDue(now: number, leaseMs: number, limit: number): Promise<RunRecord[]>;
+  /**
+   * A page of runs matching `query`, ordered by (createdAt, id) descending.
+   * The order is part of the contract: it is what lets a cursor name an exact
+   * position instead of an offset that shifts as new runs are created.
+   */
+  list(query: RunQuery): Promise<RunPage>;
 }

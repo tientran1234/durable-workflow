@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   ConflictError,
   NondeterminismError,
+  type RunPage,
   StepFailedError,
   WaitTimeoutError,
   defineWorkflow,
@@ -313,5 +314,148 @@ describe("worker", () => {
     await new Promise((r) => setTimeout(r, 30));
     await handle.stop();
     expect((await engine.get(id))?.output).toBe(42);
+  });
+});
+
+describe("listing", () => {
+  const counter = defineWorkflow<null, number>("counter", async (ctx) => ctx.step("one", () => 1));
+  const waiter = defineWorkflow<null, void>("waiter", async (ctx) => {
+    await ctx.waitFor("go");
+  });
+
+  it("filters by workflow and by status", async () => {
+    const { engine } = harness([counter, waiter]);
+    await engine.start(counter, null, { id: "c1" });
+    await engine.start(counter, null, { id: "c2" });
+    const w = await engine.start(waiter, null, { id: "w1" });
+    await engine.settle(w);
+
+    expect((await engine.list({ workflow: "counter" })).runs.map((r) => r.id)).toEqual(["c2", "c1"]);
+    expect((await engine.list({ status: "waiting" })).runs.map((r) => r.id)).toEqual(["w1"]);
+    expect((await engine.list({ workflow: "counter", status: "waiting" })).runs).toEqual([]);
+    expect((await engine.list()).runs).toHaveLength(3);
+  });
+
+  it("pages through every run exactly once when they share a creation time", async () => {
+    const { engine } = harness([counter]);
+    for (const id of ["r1", "r2", "r3", "r4", "r5"]) await engine.start(counter, null, { id });
+
+    const seen: string[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < 5; page++) {
+      const result: RunPage = await engine.list(cursor === null ? { limit: 2 } : { limit: 2, cursor });
+      seen.push(...result.runs.map((r) => r.id));
+      cursor = result.cursor;
+      if (cursor === null) break;
+    }
+
+    // Identical createdAt, so only the id tiebreak keeps the boundary exact.
+    expect(seen).toEqual(["r5", "r4", "r3", "r2", "r1"]);
+    expect(cursor).toBeNull();
+  });
+
+  it("does not repeat a run when new ones are created mid-page", async () => {
+    const { engine } = harness([counter]);
+    for (const id of ["r1", "r2", "r3", "r4"]) await engine.start(counter, null, { id });
+
+    const first = await engine.list({ limit: 2 });
+    expect(first.runs.map((r) => r.id)).toEqual(["r4", "r3"]);
+
+    // Sorts ahead of the first page: an offset would push r3 down into page two.
+    await engine.start(counter, null, { id: "r9" });
+
+    const second = await engine.list({ limit: 2, cursor: first.cursor ?? "" });
+    expect(second.runs.map((r) => r.id)).toEqual(["r2", "r1"]);
+    expect(second.cursor).toBeNull();
+  });
+
+  it("clamps the page size and rejects a cursor it did not issue", async () => {
+    const { engine } = harness([counter]);
+    await engine.start(counter, null, { id: "r1" });
+    await engine.start(counter, null, { id: "r2" });
+
+    expect((await engine.list({ limit: 0 })).runs).toHaveLength(1);
+    expect((await engine.list({ limit: 10_000 })).runs).toHaveLength(2);
+    await expect(engine.list({ cursor: "not-a-cursor" })).rejects.toThrow(/invalid cursor/);
+  });
+});
+
+describe("run view", () => {
+  const fulfilment = defineWorkflow<{ order: string }, string>("fulfilment", async (ctx) => {
+    await ctx.step("charge", () => "rcpt_1");
+    await ctx.sleep("cool-off", 1_000);
+    const review = await ctx.waitFor<{ approved: boolean }>("review");
+    return review.approved ? "shipped" : "held";
+  });
+
+  it("renders history as a timeline of offsets from the start", async () => {
+    const { engine, advance } = harness([fulfilment]);
+    const id = await engine.start(fulfilment, { order: "ord_42" }, { id: "run-1" });
+    await engine.settle(id);
+    advance(1_000);
+    await engine.settle(id);
+    advance(500);
+    await engine.signal(id, "review", { approved: true });
+
+    const view = await engine.view(id);
+    expect(view?.status).toBe("completed");
+    expect(view?.output).toBe("shipped");
+    expect(view?.input).toEqual({ order: "ord_42" });
+    expect(view?.durationMs).toBe(1_500);
+    expect(view?.blockedOn).toBeNull();
+    expect(view?.timeline.map((e) => [e.seq, e.elapsedMs, e.summary])).toEqual([
+      [0, 0, 'step "charge" completed'],
+      [1, 1_000, 'timer "cool-off" fired'],
+      [2, 1_500, 'signal "review" received'],
+    ]);
+    expect(JSON.parse(JSON.stringify(view))).toEqual(view); // an admin endpoint can send it as-is
+  });
+
+  it("says what a sleeping run is blocked on, and until when", async () => {
+    const { engine } = harness([fulfilment]);
+    const id = await engine.start(fulfilment, { order: "ord_1" });
+    await engine.settle(id);
+
+    expect((await engine.view(id))?.blockedOn).toEqual({ kind: "timer", name: "cool-off", until: T0 + 1_000 });
+  });
+
+  it("says which signal a waiting run wants, and its deadline", async () => {
+    const wf = defineWorkflow<null, void>("approval", async (ctx) => {
+      await ctx.waitFor("sign-off", { timeoutMs: 5_000 });
+    });
+    const { engine } = harness([wf]);
+    const id = await engine.start(wf, null);
+    await engine.settle(id);
+
+    expect((await engine.view(id))?.blockedOn).toEqual({ kind: "signal", name: "sign-off", until: T0 + 5_000 });
+  });
+
+  it("distinguishes a retry backoff from a sleep, and reports the failure", async () => {
+    const wf = defineWorkflow<null, string>("flaky", async (ctx) =>
+      ctx.step("call-api", () => {
+        throw new Error("boom");
+      }),
+    );
+    const { engine } = harness([wf]);
+    const id = await engine.start(wf, null);
+    await engine.settle(id);
+
+    const view = await engine.view(id);
+    expect(view?.status).toBe("sleeping");
+    expect(view?.blockedOn).toEqual({ kind: "retry", name: "call-api", until: T0 + 1_000 });
+    expect(view?.timeline[0]?.summary).toBe('step "call-api" failed on attempt 1, retrying: boom');
+  });
+
+  it("counts signals buffered ahead of their waitFor", async () => {
+    const wf = defineWorkflow<null, void>("inbox", async (ctx) => {
+      await ctx.waitFor("mail");
+    });
+    const { engine } = harness([wf]);
+    const id = await engine.start(wf, null);
+    await engine.signal(id, "mail", "first");
+    await engine.signal(id, "mail", "second");
+
+    expect((await engine.view(id))?.pendingSignals).toEqual({ mail: 2 });
+    expect(await engine.view("no-such-run")).toBeNull();
   });
 });

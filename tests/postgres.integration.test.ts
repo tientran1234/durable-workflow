@@ -95,6 +95,34 @@ describe.skipIf(!url)("PostgresStore", () => {
     expect(await store.claimDue(T0 + 10_001, 10_000, 10)).toHaveLength(1);
   });
 
+  it("lists runs newest first, filtered, and pages with an exact cursor", async () => {
+    // Same createdAt for every run, so the page boundary rests on the id tiebreak.
+    const engine = new Engine({ store, workflows: [wf], now: () => T0 });
+    for (const id of ["r1", "r2", "r3", "r4"]) await engine.start(wf, { n: 1 }, { id });
+    const waiting = await engine.start(wf, { n: 1 }, { id: "r5" });
+    await engine.settle(waiting); // sleeping, so it drops out of a status filter
+
+    const first = await engine.list({ limit: 2 });
+    expect(first.runs.map((r) => r.id)).toEqual(["r5", "r4"]);
+    const second = await engine.list({ limit: 2, cursor: first.cursor ?? "" });
+    expect(second.runs.map((r) => r.id)).toEqual(["r3", "r2"]);
+    const third = await engine.list({ limit: 2, cursor: second.cursor ?? "" });
+    expect(third.runs.map((r) => r.id)).toEqual(["r1"]);
+    expect(third.cursor).toBeNull();
+
+    expect((await engine.list({ status: "running" })).runs.map((r) => r.id)).toEqual(["r4", "r3", "r2", "r1"]);
+    expect((await engine.list({ workflow: "nope" })).runs).toEqual([]);
+  });
+
+  it("hydrates listed runs from the same columns as get()", async () => {
+    const engine = new Engine({ store, workflows: [wf], now: () => T0 });
+    const id = await engine.start(wf, { n: 21 });
+    await engine.settle(id);
+
+    const [listed] = (await engine.list({ workflow: "pg-sum" })).runs;
+    expect(listed).toEqual(await store.get(id));
+  });
+
   it("does not hand out sleeping runs before their wake time", async () => {
     let now = T0;
     const engine = new Engine({ store, workflows: [wf], now: () => now });
