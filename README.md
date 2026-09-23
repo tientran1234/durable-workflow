@@ -51,6 +51,39 @@ in microseconds and resumes exactly where it was.
 waiting for, persist, and unwind the function by throwing a control-flow
 sentinel. The run costs nothing until a signal arrives or the timer is due.
 
+## Inspecting runs
+
+`engine.list` pages over runs, newest first; `engine.view` renders one run for
+an admin screen.
+
+```ts
+const { runs, cursor } = await engine.list({ workflow: "fulfilment", status: "waiting", limit: 20 });
+const next = cursor ? await engine.list({ workflow: "fulfilment", cursor }) : null;
+
+const view = await engine.view(runId);
+// {
+//   id, workflow: "fulfilment", status: "sleeping", durationMs: 1200,
+//   input: { orderId: "ord_42" }, output: undefined, error: null,
+//   blockedOn: { kind: "timer", name: "cool-off", until: 1800000003601200 },
+//   pendingSignals: {},
+//   timeline: [
+//     { seq: 0, elapsedMs: 0,    type: "step.completed",  name: "charge",        summary: 'step "charge" completed' },
+//     { seq: 1, elapsedMs: 1200, type: "signal.received", name: "manual-review", summary: 'signal "manual-review" received' },
+//   ],
+// }
+```
+
+`blockedOn` is the question an operator actually has — is this run waiting on a
+signal, a timer, or a retry backoff, and until when — which otherwise has to be
+pieced together from `status`, `waitingFor`, `pendingTimer` and history. The
+view is plain JSON: an admin endpoint can return it unchanged.
+
+Paging is keyset, not offset. Runs are ordered by `(createdAt, id)` descending
+and `cursor` names one exact row, so a page boundary stays correct while new
+runs are being created — an offset would skip or repeat rows. Cursors are
+opaque; pass back what the previous page returned. `limit` defaults to 50 and
+is capped at 500.
+
 ## Design decisions
 
 **Retries are persisted wake times, not `setTimeout`.** A failed step records
@@ -92,9 +125,10 @@ extra API.
 | `MemoryStore` | tests, scripts, single process | version check |
 | `PostgresStore` (`durable-workflow/postgres`, needs `pg`) | production | version check + `FOR UPDATE SKIP LOCKED` |
 
-Any `RunStore` implementation with `create / get / save(version) / claimDue`
-works. `save` must be conditional on `version` and `claimDue` must lease
-atomically — that is the whole contract.
+Any `RunStore` implementation with `create / get / save(version) / claimDue /
+list` works. `save` must be conditional on `version`, `claimDue` must lease
+atomically, and `list` must order by `(createdAt, id)` descending — that is the
+whole contract.
 
 ## Layout
 
@@ -105,12 +139,16 @@ src/
   engine.ts       start / tick / signal / cancel / worker; lease + execute
   retry.ts        backoff policy
   due.ts          what "due" means, shared by engine and stores
+  list.ts         listing order and cursor codec, shared by engine and stores
+  view.ts         a run rendered for an admin screen: blockedOn + history as a timeline
   stores/memory.ts
   stores/postgres.ts   JSONB record + mirrored query columns + SKIP LOCKED claim
 tests/
-  engine.test.ts        17 tests with a hand-driven clock: memoisation, durable
-                        backoff, early signals, timeouts, nondeterminism, leases
-  postgres.integration.test.ts   disjoint claims across concurrent workers, stale writes
+  engine.test.ts        26 tests with a hand-driven clock: memoisation, durable
+                        backoff, early signals, timeouts, nondeterminism, leases,
+                        listing and the run view
+  postgres.integration.test.ts   disjoint claims across concurrent workers, stale
+                        writes, keyset paging
 ```
 
 ## Run

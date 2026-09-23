@@ -1,5 +1,6 @@
 import type { Pool } from "pg";
-import type { RunRecord, RunStore } from "../types.js";
+import { decodeCursor, encodeCursor, pageLimit } from "../list.js";
+import type { RunPage, RunQuery, RunRecord, RunStore } from "../types.js";
 
 interface Row {
   data: RunRecord;
@@ -40,6 +41,9 @@ export class PostgresStore implements RunStore {
       )`);
     await this.pool.query(
       `CREATE INDEX IF NOT EXISTS ${this.table}_due ON ${this.table} (status, wake_at) WHERE status IN ('running','sleeping','waiting')`,
+    );
+    await this.pool.query(
+      `CREATE INDEX IF NOT EXISTS ${this.table}_recent ON ${this.table} (created_at DESC, id DESC)`,
     );
   }
 
@@ -96,6 +100,29 @@ export class PostgresStore implements RunStore {
       [now, leaseMs, limit],
     );
     return rows.map((row) => this.hydrate(row));
+  }
+
+  /**
+   * Keyset pagination: the cursor is compared as a row, `(created_at, id) <
+   * (cursor)`, which the (created_at DESC, id DESC) index answers directly and
+   * which stays exact while new runs are being created.
+   */
+  async list(query: RunQuery): Promise<RunPage> {
+    const limit = pageLimit(query.limit);
+    const cursor = query.cursor === undefined ? null : decodeCursor(query.cursor);
+    const { rows } = await this.pool.query<Row>(
+      `SELECT data, status, wake_at, lease_until, version FROM ${this.table}
+        WHERE ($1::text IS NULL OR workflow = $1)
+          AND ($2::text IS NULL OR status = $2)
+          AND ($3::bigint IS NULL OR (created_at, id) < ($3::bigint, $4::text))
+        ORDER BY created_at DESC, id DESC
+        LIMIT $5`,
+      [query.workflow ?? null, query.status ?? null, cursor?.createdAt ?? null, cursor?.id ?? null, limit + 1],
+    );
+    // One extra row tells us whether a next page exists without a second query.
+    const runs = rows.slice(0, limit).map((row) => this.hydrate(row));
+    const last = runs[runs.length - 1];
+    return { runs, cursor: rows.length > limit && last ? encodeCursor(last) : null };
   }
 
   private hydrate(row: Row): RunRecord {

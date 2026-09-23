@@ -1,5 +1,6 @@
 import { isDue } from "../due.js";
-import type { RunRecord, RunStore } from "../types.js";
+import { afterCursor, byNewest, decodeCursor, encodeCursor, pageLimit } from "../list.js";
+import type { RunPage, RunQuery, RunRecord, RunStore } from "../types.js";
 
 /** In-process store. Every read returns a copy, so callers cannot bypass save(). */
 export class MemoryStore implements RunStore {
@@ -33,6 +34,26 @@ export class MemoryStore implements RunStore {
       run.version += 1;
     }
     return due.map((r) => structuredClone(r));
+  }
+
+  async list(query: RunQuery): Promise<RunPage> {
+    const limit = pageLimit(query.limit);
+    const cursor = query.cursor === undefined ? null : decodeCursor(query.cursor);
+    const matched = [...this.runs.values()]
+      .filter((r) => query.workflow === undefined || r.workflow === query.workflow)
+      .filter((r) => query.status === undefined || r.status === query.status)
+      .filter((r) => cursor === null || afterCursor(r, cursor))
+      .sort(byNewest);
+
+    // One extra row tells us whether a next page exists without a second query.
+    const page = matched.slice(0, limit + 1);
+    const more = page.length > limit;
+    if (more) page.pop();
+    const last = page[page.length - 1];
+    return {
+      runs: page.map((r) => structuredClone(r)),
+      cursor: more && last ? encodeCursor(last) : null,
+    };
   }
 
   /** Test helper. */
