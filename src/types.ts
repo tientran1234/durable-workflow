@@ -11,7 +11,8 @@ export type HistoryEvent =
   | { seq: number; call: number; type: "step.failed"; name: string; attempt: number; error: string; retryAt?: number; at: number }
   | { seq: number; call: number; type: "signal.received"; name: string; payload: unknown; at: number }
   | { seq: number; call: number; type: "signal.timeout"; name: string; at: number }
-  | { seq: number; call: number; type: "timer.fired"; name: string; at: number };
+  | { seq: number; call: number; type: "timer.fired"; name: string; at: number }
+  | { seq: number; call: number; type: "child.started"; name: string; childRunId: string; at: number };
 
 /** Omit that distributes over a union — plain Omit collapses HistoryEvent to its common keys. */
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
@@ -23,6 +24,8 @@ export interface RunRecord {
   id: string;
   workflow: string;
   input: unknown;
+  /** Set when ctx.startChild created this run: where to deliver its outcome. */
+  parent: { runId: string; signal: string } | null;
   status: RunStatus;
   history: HistoryEvent[];
   /** Signals that arrived before the workflow reached the matching waitFor. */
@@ -50,6 +53,25 @@ export interface RetryPolicy {
 export interface StepOptions {
   retry?: Partial<RetryPolicy>;
 }
+
+/**
+ * A child run as its parent addresses it. Everything in it is derived from the
+ * parent's run id and the position of the startChild call, so the same handle
+ * comes back on every replay.
+ */
+export interface ChildHandle<Output = unknown> {
+  runId: string;
+  workflow: string;
+  /** The signal the engine delivers to the parent when the child finishes. */
+  signal: string;
+  /** Phantom: carries the child's output type to waitForChild. Never present at runtime. */
+  readonly __output?: Output;
+}
+
+/** The payload of a child's completion signal. */
+export type ChildOutcome =
+  | { status: "completed"; output: unknown }
+  | { status: "failed" | "canceled"; error: string };
 
 export interface WorkflowContext<Input> {
   readonly runId: string;

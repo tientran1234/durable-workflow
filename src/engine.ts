@@ -50,7 +50,7 @@ export class Engine {
   async start<Input>(
     workflow: WorkflowDefinition<Input, unknown> | string,
     input: Input,
-    options: { id?: string } = {},
+    options: { id?: string; parent?: RunRecord["parent"] } = {},
   ): Promise<string> {
     const name = typeof workflow === "string" ? workflow : workflow.name;
     if (!this.workflows.has(name)) throw new WorkflowNotFoundError(name);
@@ -59,6 +59,7 @@ export class Engine {
       id: options.id ?? this.newId(),
       workflow: name,
       input,
+      parent: options.parent ?? null,
       status: "running",
       history: [],
       pendingSignals: {},

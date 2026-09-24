@@ -30,6 +30,23 @@ export class WaitTimeoutError extends Error {
   }
 }
 
+/**
+ * A child run finished without a result. Thrown into the parent by
+ * ctx.waitForChild, so supervising a child is plain code: catch it, compensate,
+ * carry on — the same shape as StepFailedError.
+ */
+export class ChildFailedError extends Error {
+  override readonly name = "ChildFailedError";
+  constructor(
+    readonly workflow: string,
+    readonly childRunId: string,
+    readonly status: "failed" | "canceled",
+    readonly reason: string,
+  ) {
+    super(`child workflow "${workflow}" (${childRunId}) ${status}: ${reason}`);
+  }
+}
+
 /** The workflow code no longer matches its own history — e.g. a step was renamed or reordered mid-run. */
 export class NondeterminismError extends Error {
   override readonly name = "NondeterminismError";

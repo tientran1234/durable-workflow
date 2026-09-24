@@ -101,5 +101,7 @@ function summarise(event: HistoryEvent): string {
       return `waitFor "${event.name}" timed out`;
     case "timer.fired":
       return `timer "${event.name}" fired`;
+    case "child.started":
+      return `child "${event.name}" started as run ${event.childRunId}`;
   }
 }
