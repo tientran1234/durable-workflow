@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { childOutcome } from "./children.js";
 import { appendEvent, createContext } from "./context.js";
 import { TERMINAL, isDue } from "./due.js";
 import {
@@ -10,7 +11,7 @@ import {
   errorMessage,
 } from "./errors.js";
 import { DEFAULT_RETRY } from "./retry.js";
-import type { RetryPolicy, RunPage, RunQuery, RunRecord, RunStore, WorkflowDefinition } from "./types.js";
+import type { ChildHandle, RetryPolicy, RunPage, RunQuery, RunRecord, RunStore, WorkflowDefinition } from "./types.js";
 import { type RunView, renderRun } from "./view.js";
 
 export interface EngineOptions {
@@ -145,6 +146,7 @@ export class Engine {
     run.wakeAt = null;
     run.waitingFor = null;
     await this.persist(run);
+    await this.notifyParent(run);
     return run;
   }
 
@@ -215,6 +217,7 @@ export class Engine {
       now: this.now,
       defaultRetry: this.defaultRetry,
       persist: (r) => this.persist(r),
+      startChild: (workflow, input, handle) => this.startChildRun(run, workflow, input, handle),
     });
 
     try {
@@ -242,7 +245,48 @@ export class Engine {
     run.leaseUntil = null;
     run.updatedAt = this.now();
     await this.persist(run);
+    if (TERMINAL.has(run.status)) await this.notifyParent(run);
     return run;
+  }
+
+  /** Create the run behind a ctx.startChild handle, unless a replay already did. */
+  private async startChildRun(
+    parent: RunRecord,
+    workflow: string,
+    input: unknown,
+    handle: ChildHandle,
+  ): Promise<void> {
+    // The id is derived from the parent and the call position, so a run already
+    // sitting under it is this child — started by a pass that died before it
+    // could record the event — and not a second one.
+    if (await this.store.get(handle.runId)) return;
+    await this.start(workflow, input, { id: handle.runId, parent: { runId: parent.id, signal: handle.signal } });
+  }
+
+  /**
+   * Tell a parent its child is done. It is an ordinary signal: a parent that has
+   * not reached waitForChild yet buffers it, one that is waiting resumes now.
+   * Retried on conflict because there is no caller to hand the error to, and a
+   * dropped notification would leave the parent waiting forever.
+   */
+  private async notifyParent(child: RunRecord, attempts = 3): Promise<void> {
+    const link = child.parent;
+    if (!link) return;
+    const outcome = childOutcome(child);
+
+    for (let attempt = 1; ; attempt++) {
+      const parent = await this.store.get(link.runId);
+      if (!parent || TERMINAL.has(parent.status)) return; // nobody left to tell
+      try {
+        await this.signal(link.runId, link.signal, outcome);
+        return;
+      } catch (err) {
+        // Another writer moved the parent between the read and the write — most
+        // often the parent's own worker, persisting the suspension we are
+        // answering. Re-read and deliver again.
+        if (!(err instanceof ConflictError) || attempt === attempts) throw err;
+      }
+    }
   }
 
   private async load(id: string): Promise<RunRecord> {

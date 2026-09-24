@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  ChildFailedError,
+  type ChildHandle,
   ConflictError,
   NondeterminismError,
   type RunPage,
@@ -457,5 +459,160 @@ describe("run view", () => {
 
     expect((await engine.view(id))?.pendingSignals).toEqual({ mail: 2 });
     expect(await engine.view("no-such-run")).toBeNull();
+  });
+});
+
+describe("child workflows", () => {
+  const double = defineWorkflow<{ n: number }, number>("double", async (ctx, input) =>
+    ctx.step("multiply", () => input.n * 2),
+  );
+
+  const supervisor = defineWorkflow<{ n: number }, number>("supervisor", async (ctx, input) => {
+    const child = await ctx.startChild(double, { n: input.n });
+    return ctx.waitForChild(child);
+  });
+
+  it("runs a child as its own run and hands the output back to the parent", async () => {
+    const { engine, drain } = harness([supervisor, double]);
+    const id = await engine.start(supervisor, { n: 21 }, { id: "p1" });
+    await drain();
+
+    const run = await engine.get(id);
+    expect(run?.status).toBe("completed");
+    expect(run?.output).toBe(42);
+
+    const child = await engine.get("p1#0");
+    expect(child?.workflow).toBe("double");
+    expect(child?.parent).toEqual({ runId: "p1", signal: "child:p1#0" });
+    expect((await engine.view(id))?.timeline[0]?.summary).toBe('child "double" started as run p1#0');
+  });
+
+  it("does not lose a child that finishes before the parent waits for it", async () => {
+    const wf = defineWorkflow<null, number>("slow-supervisor", async (ctx) => {
+      const child = await ctx.startChild(double, { n: 5 });
+      await ctx.sleep("paperwork", 10_000);
+      return ctx.waitForChild(child);
+    });
+    const { engine, drain, advance } = harness([wf, double]);
+    const id = await engine.start(wf, null, { id: "p1" });
+
+    await drain(); // the child finishes while the parent is still asleep
+    expect((await engine.get(id))?.pendingSignals).toEqual({ "child:p1#0": [{ status: "completed", output: 10 }] });
+
+    advance(10_000);
+    await drain();
+    expect((await engine.get(id))?.output).toBe(10);
+  });
+
+  it("starts the child once when a crash lost the record of the start", async () => {
+    let started = 0;
+    const counted = defineWorkflow<null, number>("counted", async (ctx) => ctx.step("work", () => ++started));
+    const wf = defineWorkflow<null, number>("parent", async (ctx) => {
+      const child = await ctx.startChild(counted, null);
+      return ctx.waitForChild(child);
+    });
+    const { engine, store, drain } = harness([wf, counted]);
+    const id = await engine.start(wf, null, { id: "p1" });
+    await engine.tick(id); // creates the child, records it, then waits
+
+    // Rewind the parent to the instant before that event was persisted: the
+    // child exists, the parent has no memory of starting it.
+    const parent = (await store.get(id))!;
+    parent.history = parent.history.filter((e) => e.type !== "child.started");
+    parent.status = "running";
+    parent.waitingFor = null;
+    await store.save(parent, parent.version);
+
+    await drain();
+    expect(store.all().filter((r) => r.workflow === "counted").map((r) => r.id)).toEqual(["p1#0"]);
+    expect(started).toBe(1);
+    expect((await engine.get(id))?.output).toBe(1);
+  });
+
+  it("throws a failed child into the parent, where it can be compensated", async () => {
+    const doomed = defineWorkflow<null, void>("doomed", async (ctx) => {
+      await ctx.step("explode", () => { throw new Error("kaboom"); }, { retry: { maxAttempts: 1 } });
+    });
+    const wf = defineWorkflow<null, string>("careful", async (ctx) => {
+      const child = await ctx.startChild(doomed, null);
+      try {
+        await ctx.waitForChild(child);
+        return "child succeeded";
+      } catch (err) {
+        if (!(err instanceof ChildFailedError)) throw err;
+        await ctx.step("compensate", () => undefined);
+        return `${err.status}: ${err.reason}`;
+      }
+    });
+    const { engine, drain } = harness([wf, doomed]);
+    const id = await engine.start(wf, null);
+    await drain();
+
+    const run = await engine.get(id);
+    expect(run?.status).toBe("completed");
+    expect(run?.output).toMatch(/^failed: step "explode" failed after 1 attempt/);
+  });
+
+  it("wakes a parent whose child was canceled, rather than leaving it waiting", async () => {
+    const patient = defineWorkflow<null, void>("patient-child", async (ctx) => {
+      await ctx.waitFor("never");
+    });
+    const wf = defineWorkflow<null, string>("guardian", async (ctx) => {
+      const child = await ctx.startChild(patient, null);
+      try {
+        await ctx.waitForChild(child);
+        return "done";
+      } catch (err) {
+        if (!(err instanceof ChildFailedError)) throw err;
+        return err.status;
+      }
+    });
+    const { engine, drain } = harness([wf, patient]);
+    const id = await engine.start(wf, null, { id: "p1" });
+    await drain();
+    expect((await engine.get(id))?.status).toBe("waiting");
+
+    await engine.cancel("p1#0");
+    expect((await engine.get(id))?.output).toBe("canceled");
+  });
+
+  it("fans out and collects every child", async () => {
+    const fan = defineWorkflow<{ ns: number[] }, number[]>("fan-out", async (ctx, input) => {
+      const children: ChildHandle<number>[] = [];
+      for (const n of input.ns) children.push(await ctx.startChild(double, { n }));
+      const results: number[] = [];
+      for (const child of children) results.push(await ctx.waitForChild(child));
+      return results;
+    });
+    const { engine, drain } = harness([fan, double]);
+    const id = await engine.start(fan, { ns: [1, 2, 3] }, { id: "p1" });
+    await drain();
+
+    const run = await engine.get(id);
+    expect(run?.output).toEqual([2, 4, 6]);
+    expect(run?.history.filter((e) => e.type === "child.started")).toHaveLength(3);
+  });
+
+  it("detects a startChild that names a different workflow than history does", async () => {
+    const triple = defineWorkflow<{ n: number }, number>("triple", async (ctx, input) =>
+      ctx.step("multiply", () => input.n * 3),
+    );
+    const { engine, store } = harness([supervisor, double, triple]);
+    const id = await engine.start(supervisor, { n: 2 }, { id: "p1" });
+    await engine.tick(id); // starts "double", then waits on it
+
+    // Deploy a version that starts a different child at the same position.
+    const v2 = defineWorkflow<{ n: number }, number>("supervisor", async (ctx, input) => {
+      const child = await ctx.startChild(triple, { n: input.n });
+      return ctx.waitForChild(child);
+    });
+    const { Engine } = await import("../src/index.js");
+    const engine2 = new Engine({ store, workflows: [v2, double, triple], now: () => T0 });
+    // The child finishes on the new deploy and signals the parent, which replays on v2.
+    for (let i = 0; i < 5 && (await engine2.processDue(10)) > 0; i++);
+
+    const run = await engine2.get(id);
+    expect(run?.status).toBe("failed");
+    expect(run?.error).toMatch(/"double" in history but "triple" now/);
   });
 });

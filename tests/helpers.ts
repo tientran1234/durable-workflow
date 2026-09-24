@@ -18,5 +18,9 @@ export function harness(workflows: WorkflowDefinition<any, any>[], opts: { lease
     store,
     now: () => now,
     advance: (ms: number) => (now += ms),
+    /** Execute everything due, including runs that other runs start. */
+    drain: async (passes = 20) => {
+      for (let i = 0; i < passes && (await engine.processDue(10)) > 0; i++);
+    },
   };
 }

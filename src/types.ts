@@ -85,6 +85,20 @@ export interface WorkflowContext<Input> {
   waitFor<T = unknown>(name: string, options?: { timeoutMs?: number }): Promise<T>;
   /** A durable timer: survives restarts, costs nothing while pending. */
   sleep(name: string, ms: number): Promise<void>;
+  /**
+   * Start `workflow` as an independent run, at most once per parent run, and
+   * return a handle to wait on. The child runs on its own; this does not block.
+   */
+  startChild<ChildInput, ChildOutput>(
+    workflow: WorkflowDefinition<ChildInput, ChildOutput> | string,
+    input: ChildInput,
+  ): Promise<ChildHandle<ChildOutput>>;
+  /**
+   * Suspend until the child finishes. Returns its output, or throws
+   * ChildFailedError if it failed or was canceled — and WaitTimeoutError if
+   * `timeoutMs` elapses first.
+   */
+  waitForChild<Output>(handle: ChildHandle<Output>, options?: { timeoutMs?: number }): Promise<Output>;
 }
 
 export interface WorkflowDefinition<Input = unknown, Output = unknown> {

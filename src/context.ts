@@ -1,6 +1,17 @@
-import { NondeterminismError, StepFailedError, Suspend, WaitTimeoutError, errorMessage } from "./errors.js";
+import { childHandle, childRunId } from "./children.js";
+import { ChildFailedError, NondeterminismError, StepFailedError, Suspend, WaitTimeoutError, errorMessage } from "./errors.js";
 import { DEFAULT_RETRY, backoffMs } from "./retry.js";
-import type { HistoryEvent, NewEvent, RetryPolicy, RunRecord, StepOptions, WorkflowContext } from "./types.js";
+import type {
+  ChildHandle,
+  ChildOutcome,
+  HistoryEvent,
+  NewEvent,
+  RetryPolicy,
+  RunRecord,
+  StepOptions,
+  WorkflowContext,
+  WorkflowDefinition,
+} from "./types.js";
 
 /** Append to history with the next sequence number. Used by the context and the engine. */
 export function appendEvent(run: RunRecord, event: NewEvent, now: number): void {
@@ -12,6 +23,8 @@ export interface ContextDeps {
   defaultRetry: RetryPolicy;
   /** Persist the run, or throw ConflictError. */
   persist: (run: RunRecord) => Promise<void>;
+  /** Create the child run behind `handle`. Idempotent: an existing run under that id is that child. */
+  startChild: (workflow: string, input: unknown, handle: ChildHandle) => Promise<void>;
 }
 
 export interface ReplayContext<Input> extends WorkflowContext<Input> {
@@ -129,6 +142,37 @@ export function createContext<Input>(run: RunRecord, deps: ContextDeps): ReplayC
       run.waitingFor = { name, call: c };
       run.wakeAt = options?.timeoutMs !== undefined ? deps.now() + options.timeoutMs : null;
       return suspend();
+    },
+
+    async startChild<ChildInput, ChildOutput>(
+      workflow: WorkflowDefinition<ChildInput, ChildOutput> | string,
+      input: ChildInput,
+    ): Promise<ChildHandle<ChildOutput>> {
+      const c = call++;
+      const name = typeof workflow === "string" ? workflow : workflow.name;
+
+      const started = at(c, ["child.started"])[0];
+      if (started && started.type === "child.started") {
+        expectName(started, name, "startChild");
+        return childHandle<ChildOutput>(started.childRunId, name);
+      }
+
+      const handle = childHandle<ChildOutput>(childRunId(run.id, c), name);
+      await deps.startChild(name, input, handle);
+      push({ call: c, type: "child.started", name, childRunId: handle.runId });
+      await deps.persist(run);
+      return handle;
+    },
+
+    async waitForChild<Output>(handle: ChildHandle<Output>, options?: { timeoutMs?: number }): Promise<Output> {
+      // Nothing durable is added here: the engine signals the parent when the
+      // child finishes, so a child that finishes first is an early signal like
+      // any other, and the wait survives a restart because waitFor does.
+      const outcome = await ctx.waitFor<ChildOutcome>(handle.signal, options);
+      if (outcome.status !== "completed") {
+        throw new ChildFailedError(handle.workflow, handle.runId, outcome.status, outcome.error);
+      }
+      return outcome.output as Output;
     },
 
     async sleep(name: string, ms: number): Promise<void> {
