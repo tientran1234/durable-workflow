@@ -51,6 +51,67 @@ in microseconds and resumes exactly where it was.
 waiting for, persist, and unwind the function by throwing a control-flow
 sentinel. The run costs nothing until a signal arrives or the timer is due.
 
+## Child workflows
+
+A child workflow is an ordinary run that reports back to the run that started
+it. Written by hand, the pattern is a step that starts the child and a
+`waitFor` that the child signals when it is done:
+
+```ts
+const parent = defineWorkflow<{ orderId: string }, string>("order", async (ctx, input) => {
+  const childId = await ctx.step("start-shipment", () => engine.start(shipment, input));
+  return ctx.waitFor<string>(`shipment-done:${childId}`);   // the child signals this on its last line
+});
+```
+
+`ctx.startChild` and `ctx.waitForChild` are that pattern, with the parts it is
+easy to get wrong: the child's id is derived rather than generated, and the
+engine sends the signal instead of the child's own code.
+
+```ts
+const fulfilment = defineWorkflow<{ orderId: string }, string>("fulfilment", async (ctx, { orderId }) => {
+  const shipment = await ctx.startChild(shipWorkflow, { orderId });
+  const invoice = await ctx.startChild(invoiceWorkflow, { orderId });   // both are running now
+
+  try {
+    const tracking = await ctx.waitForChild(shipment, { timeoutMs: 24 * 3600_000 });
+    await ctx.waitForChild(invoice);
+    return tracking;
+  } catch (err) {
+    if (!(err instanceof ChildFailedError)) throw err;   // never swallow: suspension is control flow
+    await ctx.step("apologise", () => mail.send(orderId));
+    return "apologised";
+  }
+});
+```
+
+A child is a run like any other: a worker claims it, its steps retry on their
+own, and it shows up in `engine.list` and `engine.view` with its own history.
+`startChild` returns immediately, so starting several and waiting for each in
+turn is fan-out.
+
+The child's id is `${parentRunId}#${call}` and the signal it answers on is
+`child:${childRunId}`, both derived from where the `startChild` call sits in the
+parent. That is what makes starting one exactly-once: a parent that dies between
+creating the child and recording the event replays into the same id, finds the
+child already there, and does not start a second one.
+
+Waiting is `ctx.waitFor` on that signal and nothing more, so it inherits what
+signals already guarantee — a child that finishes before the parent gets to
+`waitForChild` is buffered, not lost — and the engine delivers the outcome when
+the child reaches a terminal state, including when it is canceled. A child that
+failed or was canceled throws `ChildFailedError` into the parent, where
+compensation is plain code, exactly like a failed step.
+
+One caveat: telling the parent means writing to a second run, and two runs are
+not written atomically. If a worker dies between the child's last write and that
+signal, the parent stays blocked on it. Give the wait a `timeoutMs`, or
+re-deliver the outcome by hand — the run view names the signal it is waiting on:
+
+```ts
+await engine.signal(parentId, childSignal(childRunId), { status: "completed", output });
+```
+
 ## Inspecting runs
 
 `engine.list` pages over runs, newest first; `engine.view` renders one run for
@@ -141,12 +202,13 @@ src/
   due.ts          what "due" means, shared by engine and stores
   list.ts         listing order and cursor codec, shared by engine and stores
   view.ts         a run rendered for an admin screen: blockedOn + history as a timeline
+  children.ts     how a parent names its child and the signal the engine answers on
   stores/memory.ts
   stores/postgres.ts   JSONB record + mirrored query columns + SKIP LOCKED claim
 tests/
-  engine.test.ts        26 tests with a hand-driven clock: memoisation, durable
+  engine.test.ts        33 tests with a hand-driven clock: memoisation, durable
                         backoff, early signals, timeouts, nondeterminism, leases,
-                        listing and the run view
+                        listing, the run view and child runs
   postgres.integration.test.ts   disjoint claims across concurrent workers, stale
                         writes, keyset paging
 ```
@@ -164,9 +226,6 @@ CI runs the full suite, Postgres included, on every push.
 
 ## What is deliberately not here
 
-- **Child workflows and fan-out.** Start them from a step and `waitFor` a
-  completion signal; a first-class API would add surface without adding a
-  guarantee.
 - **Versioned migration of in-flight runs.** Nondeterminism is detected, not
   healed. Drain old runs on the old code, or branch on a version field in input.
 - **Very large histories.** A run with tens of thousands of steps replays them
