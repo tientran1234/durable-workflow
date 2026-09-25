@@ -23,8 +23,12 @@ export interface ContextDeps {
   defaultRetry: RetryPolicy;
   /** Persist the run, or throw ConflictError. */
   persist: (run: RunRecord) => Promise<void>;
-  /** Create the child run behind `handle`. Idempotent: an existing run under that id is that child. */
-  startChild: (workflow: string, input: unknown, handle: ChildHandle) => Promise<void>;
+  /**
+   * Create the child run behind `handle`. Idempotent: an existing run under
+   * that id is that child. `version` is absent when the child was named by
+   * string, which starts it on the latest.
+   */
+  startChild: (target: { name: string; version?: number }, input: unknown, handle: ChildHandle) => Promise<void>;
 }
 
 export interface ReplayContext<Input> extends WorkflowContext<Input> {
@@ -158,7 +162,7 @@ export function createContext<Input>(run: RunRecord, deps: ContextDeps): ReplayC
       }
 
       const handle = childHandle<ChildOutput>(childRunId(run.id, c), name);
-      await deps.startChild(name, input, handle);
+      await deps.startChild(typeof workflow === "string" ? { name } : { name, version: workflow.version }, input, handle);
       push({ call: c, type: "child.started", name, childRunId: handle.runId });
       await deps.persist(run);
       return handle;

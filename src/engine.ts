@@ -7,12 +7,12 @@ import {
   NondeterminismError,
   RunNotFoundError,
   Suspend,
-  WorkflowNotFoundError,
   errorMessage,
 } from "./errors.js";
 import { DEFAULT_RETRY } from "./retry.js";
 import type { ChildHandle, RetryPolicy, RunPage, RunQuery, RunRecord, RunStore, WorkflowDefinition } from "./types.js";
 import { type RunView, renderRun } from "./view.js";
+import { WorkflowRegistry, runVersion } from "./versions.js";
 
 export interface EngineOptions {
   store: RunStore;
@@ -32,7 +32,7 @@ export interface WorkerHandle {
 
 export class Engine {
   private readonly store: RunStore;
-  private readonly workflows = new Map<string, WorkflowDefinition>();
+  private readonly workflows = new WorkflowRegistry();
   private readonly now: () => number;
   private readonly leaseMs: number;
   private readonly defaultRetry: RetryPolicy;
@@ -40,25 +40,30 @@ export class Engine {
 
   constructor(options: EngineOptions) {
     this.store = options.store;
-    for (const wf of options.workflows) this.workflows.set(wf.name, wf);
+    for (const wf of options.workflows) this.workflows.add(wf);
     this.now = options.now ?? (() => Date.now());
     this.leaseMs = options.leaseMs ?? 30_000;
     this.defaultRetry = { ...DEFAULT_RETRY, ...options.defaultRetry };
     this.newId = options.idFactory ?? randomUUID;
   }
 
-  /** Create a run. It executes on the next tick / worker pass, not here. */
+  /**
+   * Create a run. It executes on the next tick / worker pass, not here.
+   * A name starts on the highest registered version; a definition starts on
+   * its own, which is how a caller pins a run to an older one.
+   */
   async start<Input>(
     workflow: WorkflowDefinition<Input, unknown> | string,
     input: Input,
     options: { id?: string; parent?: RunRecord["parent"] } = {},
   ): Promise<string> {
-    const name = typeof workflow === "string" ? workflow : workflow.name;
-    if (!this.workflows.has(name)) throw new WorkflowNotFoundError(name);
+    const definition =
+      typeof workflow === "string" ? this.workflows.latest(workflow) : this.workflows.get(workflow.name, workflow.version);
     const now = this.now();
     const run: RunRecord = {
       id: options.id ?? this.newId(),
-      workflow: name,
+      workflow: definition.name,
+      workflowVersion: definition.version,
       input,
       parent: options.parent ?? null,
       status: "running",
@@ -210,14 +215,15 @@ export class Engine {
       run.wakeAt = null;
     }
 
-    const definition = this.workflows.get(run.workflow);
-    if (!definition) throw new WorkflowNotFoundError(run.workflow);
+    // The version the run started on, not the newest: a deploy must not change
+    // what a run already in flight means.
+    const definition = this.workflows.get(run.workflow, runVersion(run));
 
     const ctx = createContext(run, {
       now: this.now,
       defaultRetry: this.defaultRetry,
       persist: (r) => this.persist(r),
-      startChild: (workflow, input, handle) => this.startChildRun(run, workflow, input, handle),
+      startChild: (target, input, handle) => this.startChildRun(run, target, input, handle),
     });
 
     try {
@@ -252,7 +258,7 @@ export class Engine {
   /** Create the run behind a ctx.startChild handle, unless a replay already did. */
   private async startChildRun(
     parent: RunRecord,
-    workflow: string,
+    target: { name: string; version?: number },
     input: unknown,
     handle: ChildHandle,
   ): Promise<void> {
@@ -260,7 +266,9 @@ export class Engine {
     // sitting under it is this child — started by a pass that died before it
     // could record the event — and not a second one.
     if (await this.store.get(handle.runId)) return;
-    await this.start(workflow, input, { id: handle.runId, parent: { runId: parent.id, signal: handle.signal } });
+    const definition =
+      target.version === undefined ? this.workflows.latest(target.name) : this.workflows.get(target.name, target.version);
+    await this.start(definition, input, { id: handle.runId, parent: { runId: parent.id, signal: handle.signal } });
   }
 
   /**
