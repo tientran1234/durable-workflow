@@ -1,5 +1,6 @@
 import { TERMINAL } from "./due.js";
 import type { HistoryEvent, RunRecord, RunStatus } from "./types.js";
+import { runVersion } from "./versions.js";
 
 /** One history event as a line on a timeline. */
 export interface TimelineEntry {
@@ -29,6 +30,8 @@ export interface RunBlockedOn {
 export interface RunView {
   id: string;
   workflow: string;
+  /** The version this run replays on — which code an operator is looking at. */
+  workflowVersion: number;
   status: RunStatus;
   createdAt: number;
   updatedAt: number;
@@ -47,6 +50,7 @@ export function renderRun(run: RunRecord): RunView {
   return {
     id: run.id,
     workflow: run.workflow,
+    workflowVersion: runVersion(run),
     status: run.status,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,

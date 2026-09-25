@@ -15,7 +15,11 @@ export type {
   StepOptions,
   WorkflowContext,
   WorkflowDefinition,
+  WorkflowOptions,
 } from "./types.js";
+
+// A run replays on the version it started on; these read that pin back.
+export { DEFAULT_VERSION, runVersion } from "./versions.js";
 
 export { renderRun } from "./view.js";
 export type { RunBlockedOn, RunView, TimelineEntry } from "./view.js";

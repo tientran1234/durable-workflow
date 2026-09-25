@@ -6,18 +6,20 @@ export const T0 = 1_800_000_000_000; // fixed epoch ms
 export function harness(workflows: WorkflowDefinition<any, any>[], opts: { leaseMs?: number } = {}) {
   let now = T0;
   const store = new MemoryStore();
-  const engine = new Engine({
+  const settings = {
     store,
-    workflows,
     now: () => now,
     leaseMs: opts.leaseMs ?? 30_000,
     defaultRetry: { initialDelayMs: 1_000, factor: 2, maxDelayMs: 60_000, maxAttempts: 3 },
-  });
+  };
+  const engine = new Engine({ ...settings, workflows });
   return {
     engine,
     store,
     now: () => now,
     advance: (ms: number) => (now += ms),
+    /** A second engine over the same store and clock: a deploy, as a live run sees it. */
+    deploy: (next: WorkflowDefinition<any, any>[]) => new Engine({ ...settings, workflows: next }),
     /** Execute everything due, including runs that other runs start. */
     drain: async (passes = 20) => {
       for (let i = 0; i < passes && (await engine.processDue(10)) > 0; i++);

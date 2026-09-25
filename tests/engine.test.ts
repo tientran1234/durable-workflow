@@ -292,6 +292,120 @@ describe("safety", () => {
   });
 });
 
+describe("workflow versions", () => {
+  const v1 = defineWorkflow<null, string>("greet", async (ctx) => {
+    const who = await ctx.step("load", () => "world");
+    await ctx.waitFor("go");
+    return `hello ${who}`;
+  });
+
+  // A v2 that would replay v1's history wrongly: the step at position 0 is
+  // named differently, and the greeting it returns is not v1's.
+  const v2 = defineWorkflow<null, string>(
+    "greet",
+    async (ctx) => {
+      const who = await ctx.step("load-contact", () => "WORLD");
+      await ctx.waitFor("go");
+      return `HELLO ${who}`;
+    },
+    { version: 2 },
+  );
+
+  it("replays a live run on the version it started on, not the one just deployed", async () => {
+    const { engine, deploy } = harness([v1]);
+    const id = await engine.start(v1, null);
+    await engine.settle(id); // step done, waiting on "go"
+
+    const deployed = deploy([v1, v2]);
+    const run = await deployed.signal(id, "go");
+
+    expect(run.status).toBe("completed");
+    expect(run.output).toBe("hello world");
+    expect(run.workflowVersion).toBe(1);
+  });
+
+  it("starts a run by name on the highest registered version", async () => {
+    const { engine } = harness([v1, v2]);
+    const id = await engine.start("greet", null);
+    await engine.settle(id);
+
+    expect((await engine.get(id))?.workflowVersion).toBe(2);
+    expect((await engine.view(id))?.workflowVersion).toBe(2);
+    expect((await engine.signal(id, "go")).output).toBe("HELLO WORLD");
+  });
+
+  it("starts a run on the version of the definition it was handed", async () => {
+    const { engine } = harness([v1, v2]);
+    const id = await engine.start(v1, null);
+    expect((await engine.get(id))?.workflowVersion).toBe(1);
+  });
+
+  it("still detects code that changed under a live run within one version", async () => {
+    const { engine, deploy } = harness([v1]);
+    const id = await engine.start(v1, null);
+    await engine.settle(id);
+
+    // v2's body shipped without the version bump that makes it a new version.
+    const forgotToBump = defineWorkflow<null, string>("greet", async (ctx) => {
+      const who = await ctx.step("load-contact", () => "WORLD");
+      await ctx.waitFor("go");
+      return `HELLO ${who}`;
+    });
+    const run = await deploy([forgotToBump]).signal(id, "go");
+
+    expect(run.status).toBe("failed");
+    expect(run.error).toMatch(/"load" in history but "load-contact" now/);
+  });
+
+  it("refuses two definitions of one name at the same version", async () => {
+    expect(() => harness([v1, v1])).toThrow(/"greet" is registered twice at version 1/);
+  });
+
+  it("fails loudly when the version a run started on is no longer registered", async () => {
+    const { engine, deploy } = harness([v1]);
+    const id = await engine.start(v1, null);
+
+    await expect(deploy([v2]).tick(id)).rejects.toThrow(/"greet" version 1 is not registered/);
+  });
+
+  it("replays a run recorded before versions existed on version 1", async () => {
+    const { engine, store } = harness([v1, v2]);
+    const id = await engine.start(v1, null);
+
+    const legacy = (await store.get(id))!;
+    delete legacy.workflowVersion;
+    await store.save(legacy, legacy.version);
+    await engine.settle(id);
+
+    expect((await engine.get(id))?.history[0]).toMatchObject({ name: "load" });
+  });
+
+  describe("children", () => {
+    const emitV1 = defineWorkflow<null, string>("emit", async (ctx) => ctx.step("emit", () => "from v1"));
+    const emitV2 = defineWorkflow<null, string>("emit", async (ctx) => ctx.step("emit", () => "from v2"), {
+      version: 2,
+    });
+    const byName = defineWorkflow<null, string>("by-name", async (ctx) =>
+      ctx.waitForChild(await ctx.startChild("emit", null)),
+    );
+    const pinned = defineWorkflow<null, string>("pinned", async (ctx) =>
+      ctx.waitForChild(await ctx.startChild(emitV1, null)),
+    );
+
+    it("starts a child named by string on the latest version, and one named by definition on its own", async () => {
+      const { engine, drain } = harness([emitV1, emitV2, byName, pinned]);
+      const latest = await engine.start(byName, null, { id: "a" });
+      const old = await engine.start(pinned, null, { id: "b" });
+      await drain();
+
+      expect((await engine.get(latest))?.output).toBe("from v2");
+      expect((await engine.get("a#0"))?.workflowVersion).toBe(2);
+      expect((await engine.get(old))?.output).toBe("from v1");
+      expect((await engine.get("b#0"))?.workflowVersion).toBe(1);
+    });
+  });
+});
+
 describe("worker", () => {
   it("processDue leases everything due and executes it once", async () => {
     let executions = 0;

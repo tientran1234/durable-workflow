@@ -1,3 +1,5 @@
+import { DEFAULT_VERSION } from "./versions.js";
+
 export type RunStatus = "running" | "sleeping" | "waiting" | "completed" | "failed" | "canceled";
 
 /**
@@ -23,6 +25,12 @@ export type NewEvent = DistributiveOmit<HistoryEvent, "seq" | "at">;
 export interface RunRecord {
   id: string;
   workflow: string;
+  /**
+   * The workflow version this run started on. It replays on that version's
+   * code for its whole life, so a deploy cannot change the meaning of a run
+   * that is already in flight. Absent on runs created before versions existed.
+   */
+  workflowVersion?: number;
   input: unknown;
   /** Set when ctx.startChild created this run: where to deliver its outcome. */
   parent: { runId: string; signal: string } | null;
@@ -103,14 +111,26 @@ export interface WorkflowContext<Input> {
 
 export interface WorkflowDefinition<Input = unknown, Output = unknown> {
   name: string;
+  /** Which revision of this code it is. Runs pin it; see DEFAULT_VERSION. */
+  version: number;
   run: (ctx: WorkflowContext<Input>, input: Input) => Promise<Output>;
+}
+
+export interface WorkflowOptions {
+  /**
+   * Bump this when a change would make live runs replay differently — a
+   * renamed or reordered ctx call, a branch that skips one. Both versions stay
+   * registered; runs already in flight keep replaying the old one.
+   */
+  version?: number;
 }
 
 export function defineWorkflow<Input, Output>(
   name: string,
   run: (ctx: WorkflowContext<Input>, input: Input) => Promise<Output>,
+  options: WorkflowOptions = {},
 ): WorkflowDefinition<Input, Output> {
-  return { name, run };
+  return { name, version: options.version ?? DEFAULT_VERSION, run };
 }
 
 export interface RunQuery {

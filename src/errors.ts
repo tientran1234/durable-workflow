@@ -69,8 +69,17 @@ export class RunNotFoundError extends Error {
 
 export class WorkflowNotFoundError extends Error {
   override readonly name = "WorkflowNotFoundError";
-  constructor(readonly workflow: string) {
-    super(`workflow "${workflow}" is not registered`);
+  constructor(
+    readonly workflow: string,
+    readonly version?: number,
+  ) {
+    super(
+      version === undefined
+        ? `workflow "${workflow}" is not registered`
+        : // Retiring a version while runs are still pinned to it strands them:
+          // they cannot replay until that code is registered again.
+          `workflow "${workflow}" version ${version} is not registered — runs started on it cannot replay without it`,
+    );
   }
 }
 
