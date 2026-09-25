@@ -112,6 +112,49 @@ re-deliver the outcome by hand — the run view names the signal it is waiting o
 await engine.signal(parentId, childSignal(childRunId), { status: "completed", output });
 ```
 
+## Versions
+
+Changing a workflow that has runs in flight is the awkward case: the code the
+engine replays is no longer the code those runs recorded. A version says which
+revision a run belongs to.
+
+```ts
+// The fulfilment workflow above is v1. v2 drops the manual review — a change
+// that would replay a live run straight past a wait it is sitting in.
+const fulfilmentV2 = defineWorkflow<{ orderId: string }, string>("fulfilment", async (ctx, { orderId }) => {
+  await ctx.step("charge", () => stripe.charge(orderId));
+  await ctx.step("ship", () => courier.book(orderId));
+  return "shipped";
+}, { version: 2 });
+
+const engine = new Engine({ store, workflows: [fulfilment, fulfilmentV2] });   // both stay registered
+```
+
+A run records the version it started on and replays on that version's code for
+its whole life. Runs waiting for a review on v1 still get one; runs started
+after the deploy ship without it. `engine.start(fulfilment, input)` starts on
+the version of the definition you hand it, `engine.start("fulfilment", input)`
+on the highest registered — so the default is the newest and pinning a run to
+an older version is deliberate.
+
+Keep the old definition registered until its runs drain. `engine.list` and
+`engine.view` report `workflowVersion`, which is how you tell when that is:
+
+```ts
+const { runs } = await engine.list({ workflow: "fulfilment", status: "waiting" });
+const stragglers = runs.filter((run) => runVersion(run) === 1);
+```
+
+A version is one registration, not a label: registering the same name twice at
+one version throws at startup, because two bodies under one version are
+indistinguishable to a run. Omitted, `version` is 1.
+
+Bump it when a change would make a live run replay differently — a renamed or
+reordered `ctx` call, a branch that skips one. Changing what happens *inside* a
+step does not need a bump; the step's recorded result is what replay uses.
+Getting that judgement wrong is not silent: shipping a changed body under the
+same version still fails the run with `NondeterminismError` naming both names.
+
 ## Inspecting runs
 
 `engine.list` pages over runs, newest first; `engine.view` renders one run for
@@ -123,7 +166,7 @@ const next = cursor ? await engine.list({ workflow: "fulfilment", cursor }) : nu
 
 const view = await engine.view(runId);
 // {
-//   id, workflow: "fulfilment", status: "sleeping", durationMs: 1200,
+//   id, workflow: "fulfilment", workflowVersion: 1, status: "sleeping", durationMs: 1200,
 //   input: { orderId: "ord_42" }, output: undefined, error: null,
 //   blockedOn: { kind: "timer", name: "cool-off", until: 1800000003601200 },
 //   pendingSignals: {},
@@ -200,6 +243,7 @@ src/
   engine.ts       start / tick / signal / cancel / worker; lease + execute
   retry.ts        backoff policy
   due.ts          what "due" means, shared by engine and stores
+  versions.ts     the registry: definitions by name and version, and a run's pin
   list.ts         listing order and cursor codec, shared by engine and stores
   view.ts         a run rendered for an admin screen: blockedOn + history as a timeline
   children.ts     how a parent names its child and the signal the engine answers on
@@ -226,8 +270,9 @@ CI runs the full suite, Postgres included, on every push.
 
 ## What is deliberately not here
 
-- **Versioned migration of in-flight runs.** Nondeterminism is detected, not
-  healed. Drain old runs on the old code, or branch on a version field in input.
+- **Migrating an in-flight run between versions.** A run finishes on the
+  version it started on; there is no hook to rewrite its history onto the next
+  one. Keep the old definition registered until those runs drain.
 - **Very large histories.** A run with tens of thousands of steps replays them
   all on every tick. Snapshotting is the fix and is out of scope here.
 - **Scheduling / cron.** Call `engine.start` from whatever already runs on a
