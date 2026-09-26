@@ -188,6 +188,44 @@ runs are being created — an offset would skip or repeat rows. Cursors are
 opaque; pass back what the previous page returned. `limit` defaults to 50 and
 is capped at 500.
 
+## Long runs
+
+Replay re-executes the workflow function from the top, and each `ctx` call has
+to find its own event. Searching the whole history for every call costs the
+length of that history per call, so a run with tens of thousands of steps gets
+slower on every tick — the work grows with what the run has already done.
+
+Compaction folds the **settled prefix** of a history into a snapshot: one event
+per call, indexed by position, which replay reads directly.
+
+```ts
+const engine = new Engine({ store, workflows, compactAfter: 1000 });   // the default
+```
+
+A call is settled when replay neither does work nor suspends at it: a completed
+step, a step that failed for the last time, a signal received or timed out, a
+fired timer, a started child. Only a prefix is ever foldable, and that comes
+free: a pass suspends at the frontier, so nothing above an unsettled call has
+events yet. A step serving out its backoff is *not* settled, so its attempt
+count is untouched.
+
+Two things this does not do. It does not make the function itself cheaper —
+nine thousand memoised steps are still nine thousand calls — it stops each one
+paying for the history behind it. And it does not shrink the record: replay
+needs the recorded results, so they stay. What it drops are the attempts a step
+made before it succeeded, which is why a retry-heavy run stops carrying them.
+
+That drop is the one cost. `engine.view` reports it rather than hiding it:
+
+```ts
+const view = await engine.view(runId);
+// compaction: { calls: 9_412, droppedEvents: 118, at: 1800000900000 }
+```
+
+The timeline still lists every settled call; the 118 superseded attempts within
+the first 9,412 positions are gone. A run whose full audit trail matters more
+than its tick cost sets `compactAfter: Infinity` and keeps all of it.
+
 ## Design decisions
 
 **Retries are persisted wake times, not `setTimeout`.** A failed step records
@@ -245,14 +283,15 @@ src/
   due.ts          what "due" means, shared by engine and stores
   versions.ts     the registry: definitions by name and version, and a run's pin
   list.ts         listing order and cursor codec, shared by engine and stores
+  compaction.ts   folding a settled history prefix into a snapshot replay indexes
   view.ts         a run rendered for an admin screen: blockedOn + history as a timeline
   children.ts     how a parent names its child and the signal the engine answers on
   stores/memory.ts
   stores/postgres.ts   JSONB record + mirrored query columns + SKIP LOCKED claim
 tests/
-  engine.test.ts        33 tests with a hand-driven clock: memoisation, durable
+  engine.test.ts        48 tests with a hand-driven clock: memoisation, durable
                         backoff, early signals, timeouts, nondeterminism, leases,
-                        listing, the run view and child runs
+                        listing, the run view, child runs and compaction
   postgres.integration.test.ts   disjoint claims across concurrent workers, stale
                         writes, keyset paging
 ```
@@ -273,7 +312,10 @@ CI runs the full suite, Postgres included, on every push.
 - **Migrating an in-flight run between versions.** A run finishes on the
   version it started on; there is no hook to rewrite its history onto the next
   one. Keep the old definition registered until those runs drain.
-- **Very large histories.** A run with tens of thousands of steps replays them
-  all on every tick. Snapshotting is the fix and is out of scope here.
+- **Ending a long run to start a fresh one.** Compaction stops replay paying
+  for history it has already settled, but the settled results themselves are
+  kept because replay needs them, so a run that never ends still grows. The fix
+  is to finish it and start a successor with the state it carries forward, by
+  hand.
 - **Scheduling / cron.** Call `engine.start` from whatever already runs on a
   schedule.
