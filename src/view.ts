@@ -1,3 +1,4 @@
+import { historyEvents } from "./compaction.js";
 import { TERMINAL } from "./due.js";
 import type { HistoryEvent, RunRecord, RunStatus } from "./types.js";
 import { runVersion } from "./versions.js";
@@ -43,6 +44,12 @@ export interface RunView {
   blockedOn: RunBlockedOn | null;
   /** Signals buffered ahead of their waitFor, by name, with how many payloads each. */
   pendingSignals: Record<string, number>;
+  /**
+   * Set once the run's history has been compacted, which is also the caveat on
+   * the timeline below: `droppedEvents` retry attempts within the first `calls`
+   * positions are no longer on record.
+   */
+  compaction: { calls: number; droppedEvents: number; at: number } | null;
   timeline: TimelineEntry[];
 }
 
@@ -62,7 +69,10 @@ export function renderRun(run: RunRecord): RunView {
     pendingSignals: Object.fromEntries(
       Object.entries(run.pendingSignals).map(([name, payloads]) => [name, payloads.length]),
     ),
-    timeline: [...run.history]
+    compaction: run.snapshot
+      ? { calls: run.snapshot.calls, droppedEvents: run.snapshot.droppedEvents, at: run.snapshot.at }
+      : null,
+    timeline: historyEvents(run)
       .sort((a, b) => a.seq - b.seq)
       .map((event) => ({
         seq: event.seq,

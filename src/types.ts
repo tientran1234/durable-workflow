@@ -16,6 +16,24 @@ export type HistoryEvent =
   | { seq: number; call: number; type: "timer.fired"; name: string; at: number }
   | { seq: number; call: number; type: "child.started"; name: string; childRunId: string; at: number };
 
+/**
+ * The settled prefix of a run's history, folded into one event per ctx call and
+ * indexed by position. Replay reads a settled call from here by position
+ * instead of scanning history for it, so a long run's ticks stop getting
+ * slower as its history grows.
+ */
+export interface HistorySnapshot {
+  /** Calls 0..calls-1 are settled by `events`; history holds only what is above them. */
+  calls: number;
+  /** The settling event for each call below `calls`, in position order. */
+  events: HistoryEvent[];
+  /** The seq the next appended event takes, since history no longer counts from zero. */
+  nextSeq: number;
+  /** Superseded retry attempts compaction dropped. Audit only; replay never needed them. */
+  droppedEvents: number;
+  at: number;
+}
+
 /** Omit that distributes over a union — plain Omit collapses HistoryEvent to its common keys. */
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
 
@@ -36,6 +54,12 @@ export interface RunRecord {
   parent: { runId: string; signal: string } | null;
   status: RunStatus;
   history: HistoryEvent[];
+  /**
+   * The folded prefix of that history. Absent until the run's history first
+   * grows past the engine's `compactAfter`, and on runs written before
+   * compaction existed.
+   */
+  snapshot?: HistorySnapshot;
   /** Signals that arrived before the workflow reached the matching waitFor. */
   pendingSignals: Record<string, unknown[]>;
   /** sleeping: when to wake. waiting: the deadline, or null for no timeout. */

@@ -1,4 +1,5 @@
 import { childHandle, childRunId } from "./children.js";
+import { nextSeq } from "./compaction.js";
 import { ChildFailedError, NondeterminismError, StepFailedError, Suspend, WaitTimeoutError, errorMessage } from "./errors.js";
 import { DEFAULT_RETRY, backoffMs } from "./retry.js";
 import type {
@@ -15,7 +16,7 @@ import type {
 
 /** Append to history with the next sequence number. Used by the context and the engine. */
 export function appendEvent(run: RunRecord, event: NewEvent, now: number): void {
-  run.history.push({ ...event, seq: run.history.length, at: now } as HistoryEvent);
+  run.history.push({ ...event, seq: nextSeq(run), at: now } as HistoryEvent);
 }
 
 export interface ContextDeps {

@@ -6,6 +6,7 @@ export type {
   ChildHandle,
   ChildOutcome,
   HistoryEvent,
+  HistorySnapshot,
   RetryPolicy,
   RunPage,
   RunQuery,
@@ -20,6 +21,9 @@ export type {
 
 // A run replays on the version it started on; these read that pin back.
 export { DEFAULT_VERSION, runVersion } from "./versions.js";
+
+// Compaction folds a run's settled history so replay stops scanning all of it.
+export { DEFAULT_COMPACT_AFTER, compactHistory, historyEvents, nextSeq, settledPrefix } from "./compaction.js";
 
 export { renderRun } from "./view.js";
 export type { RunBlockedOn, RunView, TimelineEntry } from "./view.js";

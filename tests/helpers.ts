@@ -1,15 +1,16 @@
-import { Engine, MemoryStore, type WorkflowDefinition } from "../src/index.js";
+import { DEFAULT_COMPACT_AFTER, Engine, MemoryStore, type WorkflowDefinition } from "../src/index.js";
 
 export const T0 = 1_800_000_000_000; // fixed epoch ms
 
 /** An engine with a clock the test moves by hand. */
-export function harness(workflows: WorkflowDefinition<any, any>[], opts: { leaseMs?: number } = {}) {
+export function harness(workflows: WorkflowDefinition<any, any>[], opts: { leaseMs?: number; compactAfter?: number } = {}) {
   let now = T0;
   const store = new MemoryStore();
   const settings = {
     store,
     now: () => now,
     leaseMs: opts.leaseMs ?? 30_000,
+    compactAfter: opts.compactAfter ?? DEFAULT_COMPACT_AFTER,
     defaultRetry: { initialDelayMs: 1_000, factor: 2, maxDelayMs: 60_000, maxAttempts: 3 },
   };
   const engine = new Engine({ ...settings, workflows });

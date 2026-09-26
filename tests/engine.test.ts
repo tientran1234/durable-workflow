@@ -8,6 +8,7 @@ import {
   StepFailedError,
   WaitTimeoutError,
   defineWorkflow,
+  historyEvents,
 } from "../src/index.js";
 import { harness, T0 } from "./helpers.js";
 
@@ -728,5 +729,168 @@ describe("child workflows", () => {
     const run = await engine2.get(id);
     expect(run?.status).toBe("failed");
     expect(run?.error).toMatch(/"double" in history but "triple" now/);
+  });
+});
+
+describe("history compaction", () => {
+  /** Long enough to compact: batches of steps separated by durable sleeps, so it replays often. */
+  const batched = defineWorkflow<{ batches: number }, number>("batched", async (ctx, input) => {
+    let total = 0;
+    for (let batch = 0; batch < input.batches; batch++) {
+      for (let i = 0; i < 20; i++) total += await ctx.step(`work-${batch}-${i}`, () => 1);
+      await ctx.sleep(`pause-${batch}`, 1_000);
+    }
+    return total;
+  });
+
+  /** Run `batched` to completion, reporting the largest history any replay had to scan. */
+  async function drive(batches: number, compactAfter: number) {
+    const { engine, advance } = harness([batched], { compactAfter });
+    const id = await engine.start(batched, { batches });
+    let run = await engine.settle(id);
+    let peak = run.history.length;
+    for (let i = 0; i < batches + 2 && run.status !== "completed"; i++) {
+      advance(1_000);
+      run = await engine.settle(id);
+      peak = Math.max(peak, run.history.length);
+    }
+    return { run, peak };
+  }
+
+  it("stops the history a replay scans growing with the length of the run", async () => {
+    const short = await drive(5, 25);
+    const long = await drive(40, 25);
+
+    expect(short.run.output).toBe(100);
+    expect(long.run.output).toBe(800);
+    // The whole point: eight times the work, the same amount of history per tick.
+    expect(long.peak).toBe(short.peak);
+    expect(long.run.snapshot?.calls).toBe(840);
+  });
+
+  it("leaves the run's outcome identical to the same run uncompacted", async () => {
+    const compacted = await drive(6, 25);
+    const whole = await drive(6, Infinity);
+
+    expect(compacted.run.output).toBe(whole.run.output);
+    expect(compacted.run.status).toBe(whole.run.status);
+    expect(whole.run.snapshot).toBeUndefined();
+    expect(whole.peak).toBe(126); // 6 × (20 steps + 1 timer), all of it scanned on every tick
+  });
+
+  it("never runs a step again once its outcome is folded into the snapshot", async () => {
+    const ran: string[] = [];
+    const wf = defineWorkflow<null, number>("counted", async (ctx) => {
+      let total = 0;
+      for (let i = 0; i < 6; i++) total += await ctx.step(`s${i}`, () => (ran.push(`s${i}`), i));
+      await ctx.sleep("pause", 1_000);
+      for (let i = 6; i < 10; i++) total += await ctx.step(`s${i}`, () => (ran.push(`s${i}`), i));
+      return total;
+    });
+    const { engine, advance } = harness([wf], { compactAfter: 3 });
+    const id = await engine.start(wf, null);
+
+    await engine.settle(id);
+    advance(1_000);
+    const run = await engine.settle(id);
+
+    expect(run.snapshot?.calls).toBe(7); // six steps and the timer they sat behind
+    expect(run.history).toHaveLength(4); // only the steps the last pass added
+    expect(run.output).toBe(45);
+    expect(ran).toEqual(["s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9"]);
+  });
+
+  it("drops the attempts a step's own success superseded", async () => {
+    let attempts = 0;
+    const wf = defineWorkflow<null, string>("flaky", async (ctx) => {
+      const out = await ctx.step("call-api", () => {
+        if (++attempts < 3) throw new Error(`boom ${attempts}`);
+        return "ok";
+      });
+      await ctx.sleep("settle", 1_000);
+      return out;
+    });
+    const { engine, advance } = harness([wf], { compactAfter: 1 });
+    const id = await engine.start(wf, null);
+
+    await engine.settle(id); // attempt 1 fails
+    advance(1_000);
+    await engine.settle(id); // attempt 2 fails
+    advance(2_000);
+    await engine.settle(id); // attempt 3 succeeds, then sleeps
+    advance(1_000);
+    const run = await engine.settle(id);
+
+    expect(run.output).toBe("ok");
+    expect(attempts).toBe(3);
+    expect(run.snapshot?.droppedEvents).toBe(2);
+    expect(historyEvents(run).filter((e) => e.type === "step.failed")).toEqual([]);
+  });
+
+  it("keeps a step still serving its backoff out of the snapshot", async () => {
+    const wf = defineWorkflow<null, void>("mixed", async (ctx) => {
+      await ctx.step("ok", () => "done");
+      await ctx.step("flaky", () => {
+        throw new Error("boom");
+      });
+    });
+    const { engine, advance } = harness([wf], { compactAfter: 1 });
+    const id = await engine.start(wf, null);
+
+    await engine.settle(id);
+    advance(1_000);
+    const run = await engine.settle(id);
+
+    expect(run.snapshot?.calls).toBe(1); // "ok" only: an unfinished call is not settled
+    expect(run.history.map((e) => e.type === "step.failed" && e.attempt)).toEqual([1, 2]);
+    expect((await engine.view(id))?.blockedOn).toEqual({ kind: "retry", name: "flaky", until: T0 + 3_000 });
+  });
+
+  it("renders folded events on the timeline and says what was dropped", async () => {
+    const wf = defineWorkflow<null, string>("audited", async (ctx) => {
+      const out = await ctx.step("charge", () => {
+        throw new Error("declined");
+      }, { retry: { maxAttempts: 2 } });
+      return out;
+    });
+    const { engine, advance } = harness([wf], { compactAfter: 1 });
+    const id = await engine.start(wf, null);
+
+    await engine.settle(id);
+    advance(1_000);
+    await engine.settle(id); // attempt 2 is the last: the call settles as a failure
+    advance(1_000);
+    await engine.tick(id);
+
+    const view = await engine.view(id);
+    expect(view?.status).toBe("failed");
+    expect(view?.compaction).toEqual({ calls: 1, droppedEvents: 1, at: T0 + 1_000 });
+    // Sequence numbers are absolute: the dropped attempt leaves a gap rather than renumbering.
+    expect(view?.timeline.map((e) => [e.seq, e.summary])).toEqual([
+      [1, 'step "charge" failed on attempt 2, no attempts left: declined'],
+    ]);
+    expect(JSON.parse(JSON.stringify(view))).toEqual(view);
+  });
+
+  it("still detects code that changed under a folded call", async () => {
+    const audit = defineWorkflow<null, void>("audit", async (ctx) => {
+      await ctx.step("a", () => 1);
+      await ctx.sleep("pause", 1_000);
+      await ctx.step("b", () => 2);
+    });
+    const renamed = defineWorkflow<null, void>("audit", async (ctx) => {
+      await ctx.step("A", () => 1); // renamed while a run sits in the sleep
+      await ctx.sleep("pause", 1_000);
+      await ctx.step("b", () => 2);
+    });
+    const { engine, advance, deploy } = harness([audit], { compactAfter: 1 });
+    const id = await engine.start(audit, null);
+
+    await engine.settle(id);
+    advance(1_000);
+    const run = await deploy([renamed]).settle(id);
+
+    expect(run.status).toBe("failed");
+    expect(run.error).toMatch(/step at position 0 was "a" in history but "A" now/);
   });
 });
