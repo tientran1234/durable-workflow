@@ -1,5 +1,5 @@
 import { childHandle, childRunId } from "./children.js";
-import { nextSeq } from "./compaction.js";
+import { nextSeq, snapshotEvent } from "./compaction.js";
 import { ChildFailedError, NondeterminismError, StepFailedError, Suspend, WaitTimeoutError, errorMessage } from "./errors.js";
 import { DEFAULT_RETRY, backoffMs } from "./retry.js";
 import type {
@@ -47,8 +47,13 @@ export function createContext<Input>(run: RunRecord, deps: ContextDeps): ReplayC
   let call = 0;
   let suspended = false;
 
-  const at = (c: number, types: HistoryEvent["type"][]) =>
-    run.history.filter((e) => e.call === c && types.includes(e.type));
+  const at = (c: number, types: HistoryEvent["type"][]) => {
+    // A settled call is one event in the snapshot, found by position. That is
+    // what stops a replay scanning the whole history once per call.
+    const folded = snapshotEvent(run, c);
+    if (folded) return types.includes(folded.type) ? [folded] : [];
+    return run.history.filter((e) => e.call === c && types.includes(e.type));
+  };
 
   const push = (event: NewEvent) => appendEvent(run, event, deps.now());
 

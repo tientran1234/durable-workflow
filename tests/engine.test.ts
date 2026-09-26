@@ -848,28 +848,35 @@ describe("history compaction", () => {
 
   it("renders folded events on the timeline and says what was dropped", async () => {
     const wf = defineWorkflow<null, string>("audited", async (ctx) => {
-      const out = await ctx.step("charge", () => {
-        throw new Error("declined");
-      }, { retry: { maxAttempts: 2 } });
-      return out;
+      try {
+        await ctx.step("charge", () => {
+          throw new Error("declined");
+        }, { retry: { maxAttempts: 2 } });
+        return "charged";
+      } catch (err) {
+        if (!(err instanceof StepFailedError)) throw err;
+        await ctx.sleep("cool-off", 1_000);
+        return "declined";
+      }
     });
     const { engine, advance } = harness([wf], { compactAfter: 1 });
     const id = await engine.start(wf, null);
 
-    await engine.settle(id);
+    await engine.settle(id); // attempt 1 fails, retrying
     advance(1_000);
     await engine.settle(id); // attempt 2 is the last: the call settles as a failure
     advance(1_000);
-    await engine.tick(id);
+    await engine.settle(id); // the timer fires and the settled prefix is folded
 
     const view = await engine.view(id);
-    expect(view?.status).toBe("failed");
-    expect(view?.compaction).toEqual({ calls: 1, droppedEvents: 1, at: T0 + 1_000 });
+    expect(view?.output).toBe("declined");
+    expect(view?.compaction).toEqual({ calls: 2, droppedEvents: 1, at: T0 + 2_000 });
     // Sequence numbers are absolute: the dropped attempt leaves a gap rather than renumbering.
     expect(view?.timeline.map((e) => [e.seq, e.summary])).toEqual([
       [1, 'step "charge" failed on attempt 2, no attempts left: declined'],
+      [2, 'timer "cool-off" fired'],
     ]);
-    expect(JSON.parse(JSON.stringify(view))).toEqual(view);
+    expect(JSON.parse(JSON.stringify(view))).toEqual(view); // an admin endpoint can send it as-is
   });
 
   it("still detects code that changed under a folded call", async () => {

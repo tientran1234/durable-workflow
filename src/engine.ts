@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { childOutcome } from "./children.js";
+import { DEFAULT_COMPACT_AFTER, compactHistory } from "./compaction.js";
 import { appendEvent, createContext } from "./context.js";
 import { TERMINAL, isDue } from "./due.js";
 import {
@@ -22,6 +23,12 @@ export interface EngineOptions {
   now?: () => number;
   /** How long one worker may hold a run before another may take it. Default 30s. */
   leaseMs?: number;
+  /**
+   * Fold a run's settled history once it holds more than this many events, so
+   * replay stops scanning all of it. Default DEFAULT_COMPACT_AFTER; Infinity
+   * never folds, which keeps every retry attempt on the run view's timeline.
+   */
+  compactAfter?: number;
   defaultRetry?: Partial<RetryPolicy>;
   idFactory?: () => string;
 }
@@ -35,6 +42,7 @@ export class Engine {
   private readonly workflows = new WorkflowRegistry();
   private readonly now: () => number;
   private readonly leaseMs: number;
+  private readonly compactAfter: number;
   private readonly defaultRetry: RetryPolicy;
   private readonly newId: () => string;
 
@@ -43,6 +51,7 @@ export class Engine {
     for (const wf of options.workflows) this.workflows.add(wf);
     this.now = options.now ?? (() => Date.now());
     this.leaseMs = options.leaseMs ?? 30_000;
+    this.compactAfter = options.compactAfter ?? DEFAULT_COMPACT_AFTER;
     this.defaultRetry = { ...DEFAULT_RETRY, ...options.defaultRetry };
     this.newId = options.idFactory ?? randomUUID;
   }
@@ -214,6 +223,10 @@ export class Engine {
       run.status = "running";
       run.wakeAt = null;
     }
+
+    // Fold before replaying rather than after: it is this pass that pays for a
+    // history it has to scan, and the wake-up event above may settle a call too.
+    if (run.history.length > this.compactAfter) compactHistory(run, now);
 
     // The version the run started on, not the newest: a deploy must not change
     // what a run already in flight means.
