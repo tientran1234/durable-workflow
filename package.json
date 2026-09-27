@@ -13,6 +13,10 @@
     "./postgres": {
       "types": "./dist/stores/postgres.d.ts",
       "import": "./dist/stores/postgres.js"
+    },
+    "./sqlite": {
+      "types": "./dist/stores/sqlite.d.ts",
+      "import": "./dist/stores/sqlite.js"
     }
   },
   "files": [
@@ -33,16 +37,22 @@
     "prepare": "tsc -p tsconfig.build.json"
   },
   "peerDependencies": {
+    "better-sqlite3": ">=11",
     "pg": "^8.13.0"
   },
   "peerDependenciesMeta": {
+    "better-sqlite3": {
+      "optional": true
+    },
     "pg": {
       "optional": true
     }
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.10.0",
     "@types/pg": "^8.11.10",
+    "better-sqlite3": "^11.10.0",
     "pg": "^8.13.0",
     "typescript": "^5.7.0",
     "vitest": "^2.1.8"
@@ -56,6 +66,7 @@
     "saga",
     "retry",
     "state-machine",
-    "postgres"
+    "postgres",
+    "sqlite"
   ]
 }
