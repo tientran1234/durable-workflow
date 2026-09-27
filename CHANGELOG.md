@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-27
+
+- SQLite store (`better-sqlite3`, optional peer) for single-node deployments and tests without Postgres: the Postgres store's schema on a file, where claiming due runs is a single `UPDATE … RETURNING` because SQLite admits one writer at a time.
+
 ## 2026-09-26
 
 - History compaction for long runs: the engine snapshots the completed prefix of a run's history — one event per settled call, indexed by position — so replay stops scanning the whole history for every call and a long run's tick cost stops growing with what it has already done.

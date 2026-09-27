@@ -265,7 +265,27 @@ extra API.
 | Store | For | Concurrency |
 |---|---|---|
 | `MemoryStore` | tests, scripts, single process | version check |
+| `SqliteStore` (`durable-workflow/sqlite`, needs `better-sqlite3`) | one node, and tests that want a real file | version check + one writer at a time |
 | `PostgresStore` (`durable-workflow/postgres`, needs `pg`) | production | version check + `FOR UPDATE SKIP LOCKED` |
+
+`SqliteStore` is the Postgres store's schema on a file: the record as JSON, the
+columns a worker queries by mirrored beside it.
+
+```ts
+import Database from "better-sqlite3";
+import { SqliteStore } from "durable-workflow/sqlite";
+
+const store = new SqliteStore(new Database("runs.db"));
+store.ensureSchema();          // also sets WAL and a busy timeout
+```
+
+It runs several workers in one process, and several processes over one file.
+What Postgres needs `SKIP LOCKED` for, SQLite gets from admitting one writer at
+a time: `claimDue` is a single `UPDATE … RETURNING`, so the runs it selects are
+the runs it leases, and the next worker's claim runs after that one commits and
+sees the leases it took. The cost is the other side of the same coin — writers
+queue rather than proceed in parallel, which is why a busy timeout is set and
+why many workers still want Postgres.
 
 Any `RunStore` implementation with `create / get / save(version) / claimDue /
 list` works. `save` must be conditional on `version`, `claimDue` must lease
@@ -287,11 +307,15 @@ src/
   view.ts         a run rendered for an admin screen: blockedOn + history as a timeline
   children.ts     how a parent names its child and the signal the engine answers on
   stores/memory.ts
+  stores/sqlite.ts     the same record on a file: one writer, so claiming is one statement
   stores/postgres.ts   JSONB record + mirrored query columns + SKIP LOCKED claim
 tests/
   engine.test.ts        48 tests with a hand-driven clock: memoisation, durable
                         backoff, early signals, timeouts, nondeterminism, leases,
                         listing, the run view, child runs and compaction
+  sqlite.test.ts        9 tests on a real file: a run resumed after the process
+                        that started it is gone, stale writes, leases across two
+                        connections, keyset paging
   postgres.integration.test.ts   disjoint claims across concurrent workers, stale
                         writes, keyset paging
 ```
@@ -300,7 +324,7 @@ tests/
 
 ```bash
 pnpm install
-pnpm test                       # unit tests need nothing
+pnpm test                       # unit tests and the SQLite store need nothing
 pnpm db:up                      # Postgres on :5434
 DATABASE_URL=postgresql://postgres:postgres@localhost:5434/workflow pnpm test
 ```
