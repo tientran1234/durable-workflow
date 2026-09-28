@@ -188,6 +188,54 @@ runs are being created — an offset would skip or repeat rows. Cursors are
 opaque; pass back what the previous page returned. `limit` defaults to 50 and
 is capped at 500.
 
+## Hooks
+
+`engine.list` and `engine.view` answer a question when you ask it. Hooks are the
+other direction: the engine tells you as runs pass the three points worth
+counting.
+
+```ts
+const engine = new Engine({
+  store,
+  workflows,
+  hooks: {
+    onRunCompleted: ({ workflow, durationMs }) => metrics.timing(`workflow.${workflow}.duration`, durationMs),
+    onRunFailed: ({ workflow, runId, error }) => pager.alert(`${workflow} run ${runId} failed: ${error}`),
+    onStepFailed: ({ workflow, step, attempt, retryAt }) =>
+      retryAt === null
+        ? pager.alert(`${workflow} step "${step}" gave up after ${attempt} attempt(s)`)
+        : metrics.increment(`workflow.${workflow}.step.${step}.retry`),
+  },
+});
+```
+
+`onStepFailed` fires once per failed attempt, and `retryAt` is the distinction
+alerting actually cares about: a number is the time the engine will try again,
+`null` means the policy is spent and the failure is about to land in the
+workflow function as `StepFailedError`. Every payload carries `runId`,
+`workflow` and the `workflowVersion` the run is pinned to, so a metric stays
+attributable to the code that produced it while a deploy drains.
+
+Three properties, all deliberate.
+
+**A hook cannot change what a run does.** It is called after the state it
+describes is persisted, and whatever it throws is dropped: a statsd socket that
+is down must not fail a run that has already succeeded. Anything that needs to
+influence the workflow belongs in the workflow, as a step.
+
+**Delivery is in-process and at-most-once.** The call happens in the worker that
+finished the run, straight after the write. A process that dies in between emits
+nothing and nothing re-emits it — the history is the audit trail, a hook is not.
+A notification that must not be lost is `ctx.step("notify", …)`, retried and
+recorded like any other side effect.
+
+**Hooks are awaited.** A slow hook slows the worker that called it, which is the
+honest default rather than an unhandled rejection later; hand the I/O to a queue
+yourself if you would rather it did not.
+
+There is no hook for a canceled run. `engine.cancel` returns to the caller that
+asked for the cancellation, which is the only party a hook would be telling.
+
 ## Long runs
 
 Replay re-executes the workflow function from the top, and each `ctx` call has
@@ -306,13 +354,15 @@ src/
   compaction.ts   folding a settled history prefix into a snapshot replay indexes
   view.ts         a run rendered for an admin screen: blockedOn + history as a timeline
   children.ts     how a parent names its child and the signal the engine answers on
+  hooks.ts        the lifecycle payloads, and the call that cannot fail a run
   stores/memory.ts
   stores/sqlite.ts     the same record on a file: one writer, so claiming is one statement
   stores/postgres.ts   JSONB record + mirrored query columns + SKIP LOCKED claim
 tests/
-  engine.test.ts        48 tests with a hand-driven clock: memoisation, durable
+  engine.test.ts        57 tests with a hand-driven clock: memoisation, durable
                         backoff, early signals, timeouts, nondeterminism, leases,
-                        listing, the run view, child runs and compaction
+                        listing, the run view, child runs, compaction and the
+                        lifecycle hooks
   sqlite.test.ts        9 tests on a real file: a run resumed after the process
                         that started it is gone, stale writes, leases across two
                         connections, keyset paging
@@ -341,5 +391,8 @@ CI runs the full suite, Postgres included, on every push.
   kept because replay needs them, so a run that never ends still grows. The fix
   is to finish it and start a successor with the state it carries forward, by
   hand.
+- **Durable hook delivery.** A lifecycle hook is an in-process call made after
+  the write it reports; a worker that dies in between emits nothing, and nothing
+  replays it. A side effect that must not be lost goes in the workflow as a step.
 - **Scheduling / cron.** Call `engine.start` from whatever already runs on a
   schedule.

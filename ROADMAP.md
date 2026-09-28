@@ -7,5 +7,5 @@ One item per pull request, in order.
 - [x] Versioned workflows: `defineWorkflow("name", run, { version: 2 })`; the run records the version it started on and replays with that version's code. Nondeterminism stays detected within a version.
 - [x] History compaction for long runs: snapshot the completed prefix so replay cost stops growing.
 - [x] SQLite store (`better-sqlite3`, optional peer) for single-node deployments and tests without Postgres.
-- [ ] Lifecycle hooks: `onRunCompleted`, `onRunFailed`, `onStepFailed` for metrics and alerting.
+- [x] Lifecycle hooks: `onRunCompleted`, `onRunFailed`, `onStepFailed` for metrics and alerting.
 - [ ] Scheduled starts: `engine.schedule(workflow, input, { every })` with idempotent run ids per period.
