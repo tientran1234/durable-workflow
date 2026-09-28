@@ -987,13 +987,20 @@ describe("lifecycle hooks", () => {
   });
 
   it("does not report an attempt again when replay reads it back from history", async () => {
+    // Both settled shapes a later replay passes over: an attempt the retry
+    // recovered from, and one the policy gave up on that the workflow caught.
     let attempts = 0;
-    const wf = defineWorkflow<null, string>("flaky", async (ctx) => {
-      const value = await ctx.step("call-api", () => {
+    const wf = defineWorkflow<null, string>("saga", async (ctx) => {
+      const value = await ctx.step("flaky", () => {
         if (++attempts === 1) throw new Error("boom");
         return "ok";
       });
-      await ctx.sleep("cool-off", 1_000); // every tick below replays that failed attempt
+      try {
+        await ctx.step("doomed", () => { throw new Error("nope"); }, { retry: { maxAttempts: 1 } });
+      } catch (err) {
+        if (!(err instanceof StepFailedError)) throw err;
+      }
+      await ctx.sleep("cool-off", 1_000); // the tick after this replays both of them
       return value;
     });
     const steps: StepFailedEvent[] = [];
@@ -1006,7 +1013,10 @@ describe("lifecycle hooks", () => {
     advance(1_000);
     expect((await engine.settle(id)).status).toBe("completed");
 
-    expect(steps).toHaveLength(1);
+    expect(steps.map((e) => [e.step, e.attempt])).toEqual([
+      ["flaky", 1],
+      ["doomed", 1],
+    ]);
   });
 
   it("reports the version a run is pinned to, not the newest registered", async () => {

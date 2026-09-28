@@ -10,7 +10,7 @@ import {
   Suspend,
   errorMessage,
 } from "./errors.js";
-import type { LifecycleHooks } from "./hooks.js";
+import { type LifecycleHooks, notify, runEvent } from "./hooks.js";
 import { DEFAULT_RETRY } from "./retry.js";
 import type { ChildHandle, RetryPolicy, RunPage, RunQuery, RunRecord, RunStore, WorkflowDefinition } from "./types.js";
 import { type RunView, renderRun } from "./view.js";
@@ -165,6 +165,7 @@ export class Engine {
     run.wakeAt = null;
     run.waitingFor = null;
     await this.persist(run);
+    await this.announce(run);
     await this.notifyParent(run);
     return run;
   }
@@ -242,6 +243,7 @@ export class Engine {
       defaultRetry: this.defaultRetry,
       persist: (r) => this.persist(r),
       startChild: (target, input, handle) => this.startChildRun(run, target, input, handle),
+      hooks: this.hooks,
     });
 
     try {
@@ -269,8 +271,30 @@ export class Engine {
     run.leaseUntil = null;
     run.updatedAt = this.now();
     await this.persist(run);
-    if (TERMINAL.has(run.status)) await this.notifyParent(run);
+    if (TERMINAL.has(run.status)) {
+      // Observers first: a hook reports what is already persisted, and must not
+      // be skipped because telling the parent went wrong.
+      await this.announce(run);
+      await this.notifyParent(run);
+    }
     return run;
+  }
+
+  /**
+   * Report a run that has just reached a terminal state. Every terminal
+   * transition comes through here exactly once — a terminal run is neither
+   * executed nor canceled again — so this is the one place that decides which
+   * of them an observer hears about.
+   *
+   * A canceled run is deliberately not one of them: engine.cancel returns to
+   * the caller that asked for the cancellation, which is the only party a hook
+   * would be telling.
+   */
+  private async announce(run: RunRecord): Promise<void> {
+    const at = this.now();
+    const event = { ...runEvent(run, at), durationMs: at - run.createdAt };
+    if (run.status === "completed") await notify(this.hooks.onRunCompleted, { ...event, output: run.output });
+    else if (run.status === "failed") await notify(this.hooks.onRunFailed, { ...event, error: run.error ?? "" });
   }
 
   /** Create the run behind a ctx.startChild handle, unless a replay already did. */

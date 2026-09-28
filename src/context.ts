@@ -1,6 +1,7 @@
 import { childHandle, childRunId } from "./children.js";
 import { nextSeq, snapshotEvent } from "./compaction.js";
 import { ChildFailedError, NondeterminismError, StepFailedError, Suspend, WaitTimeoutError, errorMessage } from "./errors.js";
+import { type LifecycleHooks, notify, runEvent } from "./hooks.js";
 import { DEFAULT_RETRY, backoffMs } from "./retry.js";
 import type {
   ChildHandle,
@@ -30,6 +31,8 @@ export interface ContextDeps {
    * string, which starts it on the latest.
    */
   startChild: (target: { name: string; version?: number }, input: unknown, handle: ChildHandle) => Promise<void>;
+  /** Observers for metrics and alerting. The step frontier reports failed attempts. */
+  hooks: LifecycleHooks;
 }
 
 export interface ReplayContext<Input> extends WorkflowContext<Input> {
@@ -65,9 +68,12 @@ export function createContext<Input>(run: RunRecord, deps: ContextDeps): ReplayC
     }
   };
 
-  const suspend = async (): Promise<never> => {
+  // `after` runs once the suspension is persisted: a hook must not report an
+  // attempt that a lost write threw away.
+  const suspend = async (after?: () => Promise<void>): Promise<never> => {
     suspended = true;
     await deps.persist(run);
+    await after?.();
     throw new Suspend();
   };
 
@@ -110,17 +116,30 @@ export function createContext<Input>(run: RunRecord, deps: ContextDeps): ReplayC
       } catch (err) {
         const policy: RetryPolicy = { ...deps.defaultRetry, ...options?.retry };
         const retryAt = attempt < policy.maxAttempts ? deps.now() + backoffMs(policy, attempt) : undefined;
-        push({ call: c, type: "step.failed", name, attempt, error: errorMessage(err), ...(retryAt !== undefined ? { retryAt } : {}) });
+        const error = errorMessage(err);
+        push({ call: c, type: "step.failed", name, attempt, error, ...(retryAt !== undefined ? { retryAt } : {}) });
+
+        // Only the frontier gets here — a replay reads the attempt back out of
+        // history above — so an attempt is reported the once it happened.
+        const report = () =>
+          notify(deps.hooks.onStepFailed, {
+            ...runEvent(run, deps.now()),
+            step: name,
+            attempt,
+            error,
+            retryAt: retryAt ?? null,
+          });
 
         if (retryAt === undefined) {
           await deps.persist(run);
-          throw new StepFailedError(name, attempt, errorMessage(err), { cause: err });
+          await report();
+          throw new StepFailedError(name, attempt, error, { cause: err });
         }
         // Durable backoff: the delay is a persisted wake time, not a setTimeout.
         // A restart during the wait loses nothing.
         run.status = "sleeping";
         run.wakeAt = retryAt;
-        return suspend();
+        return suspend(report);
       }
     },
 
