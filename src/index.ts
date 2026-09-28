@@ -25,6 +25,15 @@ export { DEFAULT_VERSION, runVersion } from "./versions.js";
 // Compaction folds a run's settled history so replay stops scanning all of it.
 export { DEFAULT_COMPACT_AFTER, compactHistory, historyEvents, nextSeq, settledPrefix } from "./compaction.js";
 
+// Lifecycle hooks: observers for metrics and alerting, never part of a run.
+export type {
+  LifecycleHooks,
+  RunCompletedEvent,
+  RunEvent,
+  RunFailedEvent,
+  StepFailedEvent,
+} from "./hooks.js";
+
 export { renderRun } from "./view.js";
 export type { RunBlockedOn, RunView, TimelineEntry } from "./view.js";
 

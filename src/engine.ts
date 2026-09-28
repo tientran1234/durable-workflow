@@ -10,6 +10,7 @@ import {
   Suspend,
   errorMessage,
 } from "./errors.js";
+import type { LifecycleHooks } from "./hooks.js";
 import { DEFAULT_RETRY } from "./retry.js";
 import type { ChildHandle, RetryPolicy, RunPage, RunQuery, RunRecord, RunStore, WorkflowDefinition } from "./types.js";
 import { type RunView, renderRun } from "./view.js";
@@ -30,6 +31,8 @@ export interface EngineOptions {
    */
   compactAfter?: number;
   defaultRetry?: Partial<RetryPolicy>;
+  /** Observers for metrics and alerting. See LifecycleHooks. */
+  hooks?: LifecycleHooks;
   idFactory?: () => string;
 }
 
@@ -44,6 +47,7 @@ export class Engine {
   private readonly leaseMs: number;
   private readonly compactAfter: number;
   private readonly defaultRetry: RetryPolicy;
+  private readonly hooks: LifecycleHooks;
   private readonly newId: () => string;
 
   constructor(options: EngineOptions) {
@@ -53,6 +57,7 @@ export class Engine {
     this.leaseMs = options.leaseMs ?? 30_000;
     this.compactAfter = options.compactAfter ?? DEFAULT_COMPACT_AFTER;
     this.defaultRetry = { ...DEFAULT_RETRY, ...options.defaultRetry };
+    this.hooks = options.hooks ?? {};
     this.newId = options.idFactory ?? randomUUID;
   }
 

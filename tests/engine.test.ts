@@ -4,8 +4,12 @@ import {
   type ChildHandle,
   ConflictError,
   NondeterminismError,
+  type RunCompletedEvent,
+  type RunFailedEvent,
   type RunPage,
+  type RunRecord,
   StepFailedError,
+  type StepFailedEvent,
   WaitTimeoutError,
   defineWorkflow,
   historyEvents,
@@ -899,5 +903,181 @@ describe("history compaction", () => {
 
     expect(run.status).toBe("failed");
     expect(run.error).toMatch(/step at position 0 was "a" in history but "A" now/);
+  });
+});
+
+describe("lifecycle hooks", () => {
+  it("reports a completed run once, with its output and how long it took", async () => {
+    const wf = defineWorkflow<null, string>("greet", async (ctx) => {
+      await ctx.sleep("pause", 1_000);
+      return ctx.step("say", () => "hi");
+    });
+    const completed: RunCompletedEvent[] = [];
+    const { engine, advance } = harness([wf], { hooks: { onRunCompleted: (e) => void completed.push(e) } });
+    const id = await engine.start(wf, null);
+
+    await engine.settle(id);
+    expect(completed).toEqual([]); // still sleeping — nothing has completed
+
+    advance(1_000);
+    await engine.settle(id);
+    await engine.tick(id); // a terminal run is not executed, so not reported twice
+
+    expect(completed).toEqual([
+      { runId: id, workflow: "greet", workflowVersion: 1, output: "hi", durationMs: 1_000, at: T0 + 1_000 },
+    ]);
+  });
+
+  it("reports a failed run with the error it failed on, and never as completed", async () => {
+    const wf = defineWorkflow<null, void>("doomed", async (ctx) => {
+      await ctx.step("never", () => { throw new Error("nope"); }, { retry: { maxAttempts: 1 } });
+    });
+    const completed: RunCompletedEvent[] = [];
+    const failed: RunFailedEvent[] = [];
+    const { engine } = harness([wf], {
+      hooks: { onRunCompleted: (e) => void completed.push(e), onRunFailed: (e) => void failed.push(e) },
+    });
+    const id = await engine.start(wf, null);
+    await engine.settle(id);
+
+    expect(completed).toEqual([]);
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({ runId: id, workflow: "doomed", workflowVersion: 1, durationMs: 0 });
+    expect(failed[0]?.error).toMatch(/"never" failed after 1 attempt\(s\): nope/);
+  });
+
+  it("reports every step attempt, with when the engine will try again", async () => {
+    let attempts = 0;
+    const wf = defineWorkflow<null, string>("flaky", async (ctx) => {
+      return ctx.step("call-api", () => {
+        attempts++;
+        if (attempts < 3) throw new Error(`boom ${attempts}`);
+        return "ok";
+      });
+    });
+    const steps: StepFailedEvent[] = [];
+    const { engine, advance } = harness([wf], { hooks: { onStepFailed: (e) => void steps.push(e) } });
+    const id = await engine.start(wf, null);
+
+    await engine.settle(id);
+    advance(1_000);
+    await engine.settle(id);
+    advance(2_000);
+    expect((await engine.settle(id)).status).toBe("completed");
+
+    expect(steps.map((e) => [e.step, e.attempt, e.error, e.retryAt])).toEqual([
+      ["call-api", 1, "boom 1", T0 + 1_000],
+      ["call-api", 2, "boom 2", T0 + 3_000], // factor 2
+    ]);
+  });
+
+  it("marks the attempt that exhausted the retry policy as having no retry left", async () => {
+    const wf = defineWorkflow<null, void>("doomed", async (ctx) => {
+      await ctx.step("never", () => { throw new Error("nope"); }, { retry: { maxAttempts: 2 } });
+    });
+    const steps: StepFailedEvent[] = [];
+    const { engine, advance } = harness([wf], { hooks: { onStepFailed: (e) => void steps.push(e) } });
+    const id = await engine.start(wf, null);
+
+    await engine.settle(id);
+    advance(1_000);
+    await engine.settle(id);
+
+    expect(steps.map((e) => e.retryAt)).toEqual([T0 + 1_000, null]);
+  });
+
+  it("does not report an attempt again when replay reads it back from history", async () => {
+    let attempts = 0;
+    const wf = defineWorkflow<null, string>("flaky", async (ctx) => {
+      const value = await ctx.step("call-api", () => {
+        if (++attempts === 1) throw new Error("boom");
+        return "ok";
+      });
+      await ctx.sleep("cool-off", 1_000); // every tick below replays that failed attempt
+      return value;
+    });
+    const steps: StepFailedEvent[] = [];
+    const { engine, advance } = harness([wf], { hooks: { onStepFailed: (e) => void steps.push(e) } });
+    const id = await engine.start(wf, null);
+
+    await engine.settle(id);
+    advance(1_000);
+    await engine.settle(id);
+    advance(1_000);
+    expect((await engine.settle(id)).status).toBe("completed");
+
+    expect(steps).toHaveLength(1);
+  });
+
+  it("reports the version a run is pinned to, not the newest registered", async () => {
+    const v1 = defineWorkflow<null, string>("pay", async (ctx) => {
+      await ctx.waitFor("approved");
+      return "v1";
+    });
+    const v2 = defineWorkflow<null, string>("pay", async () => "v2", { version: 2 });
+    const completed: RunCompletedEvent[] = [];
+    const { engine, deploy } = harness([v1], { hooks: { onRunCompleted: (e) => void completed.push(e) } });
+    const id = await engine.start(v1, null);
+    await engine.settle(id);
+
+    await deploy([v1, v2]).signal(id, "approved", null);
+
+    expect(completed.map((e) => [e.workflowVersion, e.output])).toEqual([[1, "v1"]]);
+  });
+
+  it("is called after the state it reports is persisted", async () => {
+    const wf = defineWorkflow<null, string>("greet", async () => "hi");
+    const asStored: RunRecord[] = [];
+    const { engine } = harness([wf], {
+      hooks: {
+        onRunCompleted: async (e) => {
+          const stored = await engine.get(e.runId);
+          if (stored) asStored.push(stored);
+        },
+      },
+    });
+    const id = await engine.start(wf, null);
+    await engine.settle(id);
+
+    expect(asStored.map((run) => [run.status, run.output])).toEqual([["completed", "hi"]]);
+  });
+
+  it("cannot fail a run: whatever a hook throws is dropped", async () => {
+    let attempts = 0;
+    const wf = defineWorkflow<null, string>("flaky", async (ctx) => {
+      return ctx.step("call-api", () => {
+        if (++attempts === 1) throw new Error("boom");
+        return "ok";
+      });
+    });
+    const { engine, advance } = harness([wf], {
+      hooks: {
+        onStepFailed: () => { throw new Error("statsd is down"); },
+        onRunCompleted: () => Promise.reject(new Error("pagerduty is down")),
+      },
+    });
+    const id = await engine.start(wf, null);
+
+    await engine.settle(id);
+    advance(1_000);
+    const run = await engine.settle(id);
+
+    expect(run.status).toBe("completed");
+    expect(run.output).toBe("ok");
+  });
+
+  it("says nothing about a canceled run — the caller asked for that itself", async () => {
+    const wf = defineWorkflow<null, void>("long", async (ctx) => {
+      await ctx.waitFor("never");
+    });
+    const reported: string[] = [];
+    const { engine } = harness([wf], {
+      hooks: { onRunCompleted: () => void reported.push("completed"), onRunFailed: () => void reported.push("failed") },
+    });
+    const id = await engine.start(wf, null);
+    await engine.settle(id);
+
+    expect((await engine.cancel(id)).status).toBe("canceled");
+    expect(reported).toEqual([]);
   });
 });
