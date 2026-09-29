@@ -34,6 +34,10 @@ export type {
   StepFailedEvent,
 } from "./hooks.js";
 
+// Scheduled starts: the period a call falls in and the run id that period takes.
+export { schedulePeriod, scheduleRunId } from "./schedule.js";
+export type { ScheduleOptions, ScheduledRun } from "./schedule.js";
+
 export { renderRun } from "./view.js";
 export type { RunBlockedOn, RunView, TimelineEntry } from "./view.js";
 

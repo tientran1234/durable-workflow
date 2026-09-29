@@ -12,6 +12,7 @@ import {
 } from "./errors.js";
 import { type LifecycleHooks, notify, runEvent } from "./hooks.js";
 import { DEFAULT_RETRY } from "./retry.js";
+import { type ScheduleOptions, type ScheduledRun, schedulePeriod, scheduleRunId } from "./schedule.js";
 import type { ChildHandle, RetryPolicy, RunPage, RunQuery, RunRecord, RunStore, WorkflowDefinition } from "./types.js";
 import { type RunView, renderRun } from "./view.js";
 import { WorkflowRegistry, runVersion } from "./versions.js";
@@ -95,6 +96,24 @@ export class Engine {
     };
     await this.store.create(run);
     return run.id;
+  }
+
+  /**
+   * Start this period's run of a schedule, unless it is already there.
+   *
+   * Call it from whatever loop you already have, as often as you like and in
+   * as many processes as you like: the run id is derived from the schedule and
+   * the period, so the period starts one run however many calls it takes.
+   */
+  async schedule<Input>(
+    workflow: WorkflowDefinition<Input, unknown> | string,
+    input: Input,
+    options: ScheduleOptions,
+  ): Promise<ScheduledRun> {
+    const periodStart = schedulePeriod(this.now(), options.every);
+    const name = options.name ?? (typeof workflow === "string" ? workflow : workflow.name);
+    const runId = scheduleRunId(name, periodStart);
+    throw new Error(`engine.schedule is not implemented yet (would be run ${runId})`);
   }
 
   get(id: string): Promise<RunRecord | null> {

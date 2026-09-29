@@ -13,6 +13,8 @@ import {
   WaitTimeoutError,
   defineWorkflow,
   historyEvents,
+  schedulePeriod,
+  scheduleRunId,
 } from "../src/index.js";
 import { harness, T0 } from "./helpers.js";
 
@@ -1089,5 +1091,118 @@ describe("lifecycle hooks", () => {
 
     expect((await engine.cancel(id)).status).toBe("canceled");
     expect(reported).toEqual([]);
+  });
+});
+
+describe("scheduled starts", () => {
+  const tick = defineWorkflow<{ job: string }, string>("nightly", async (ctx, input) => {
+    return ctx.step("work", () => `did ${input.job}`);
+  });
+
+  it("starts the period's run and reports that it was this call that started it", async () => {
+    const { engine, store } = harness([tick]);
+
+    const first = await engine.schedule(tick, { job: "rollup" }, { every: 60_000 });
+
+    expect(first).toEqual({ runId: scheduleRunId("nightly", T0), periodStart: T0, created: true });
+    expect(store.all().map((r) => [r.id, r.workflow, r.input])).toEqual([
+      [scheduleRunId("nightly", T0), "nightly", { job: "rollup" }],
+    ]);
+  });
+
+  it("starts nothing on a second call in the same period, however far into it", async () => {
+    const { engine, store, advance } = harness([tick]);
+
+    const first = await engine.schedule(tick, { job: "rollup" }, { every: 60_000 });
+    advance(59_999);
+    const again = await engine.schedule(tick, { job: "rollup" }, { every: 60_000 });
+
+    expect(again).toEqual({ runId: first.runId, periodStart: T0, created: false });
+    expect(store.all()).toHaveLength(1);
+  });
+
+  it("does not start the period again once its run has finished", async () => {
+    // The run is the record that the period fired, so a period whose work is
+    // already done must not fire a second time when the loop comes back round.
+    const { engine, store, advance, drain } = harness([tick]);
+
+    await engine.schedule(tick, { job: "rollup" }, { every: 60_000 });
+    await drain();
+    advance(1_000);
+    const again = await engine.schedule(tick, { job: "rollup" }, { every: 60_000 });
+
+    expect(store.all().map((r) => [r.status, r.output])).toEqual([["completed", "did rollup"]]);
+    expect(again.created).toBe(false);
+  });
+
+  it("starts a new run once the period rolls over", async () => {
+    const { engine, store, advance } = harness([tick]);
+
+    await engine.schedule(tick, { job: "rollup" }, { every: 60_000 });
+    advance(60_000);
+    const next = await engine.schedule(tick, { job: "rollup" }, { every: 60_000 });
+
+    expect(next).toEqual({ runId: scheduleRunId("nightly", T0 + 60_000), periodStart: T0 + 60_000, created: true });
+    expect(store.all()).toHaveLength(2);
+  });
+
+  it("measures periods from the epoch, not from the first call", async () => {
+    // Two processes that start minutes apart have to agree on where a period
+    // ends, and they never speak: the only thing both of them have is the clock.
+    const { engine, advance } = harness([tick]);
+
+    advance(500);
+    const late = await engine.schedule(tick, { job: "rollup" }, { every: 60_000 });
+    advance(59_500);
+    const next = await engine.schedule(tick, { job: "rollup" }, { every: 60_000 });
+
+    expect(late.periodStart).toBe(T0);
+    expect(next.periodStart).toBe(T0 + 60_000);
+    expect(schedulePeriod(T0 + 500, 60_000)).toBe(T0);
+  });
+
+  it("starts one run between two processes that drive the same schedule at once", async () => {
+    // The real deployment: every worker runs the loop, so the calls overlap and
+    // both see no run before either has written one. The id is the primary key
+    // in every store, so the second write loses rather than forking the period.
+    const { engine, store, deploy } = harness([tick]);
+    const other = deploy([tick]);
+
+    const results = await Promise.all([
+      engine.schedule(tick, { job: "rollup" }, { every: 60_000 }),
+      other.schedule(tick, { job: "rollup" }, { every: 60_000 }),
+    ]);
+
+    expect(results.filter((r) => r.created)).toHaveLength(1);
+    expect(results.map((r) => r.runId)).toEqual([scheduleRunId("nightly", T0), scheduleRunId("nightly", T0)]);
+    expect(store.all()).toHaveLength(1);
+  });
+
+  it("keeps two schedules over one workflow apart when they are named apart", async () => {
+    const { engine, store } = harness([tick]);
+
+    await engine.schedule(tick, { job: "rollup" }, { every: 60_000, name: "rollup" });
+    await engine.schedule(tick, { job: "digest" }, { every: 60_000, name: "digest" });
+
+    expect(store.all().map((r) => r.id).sort()).toEqual([scheduleRunId("digest", T0), scheduleRunId("rollup", T0)]);
+  });
+
+  it("rejects a period that is not a positive number of milliseconds", async () => {
+    const { engine } = harness([tick]);
+
+    await expect(engine.schedule(tick, { job: "rollup" }, { every: 0 })).rejects.toThrow(RangeError);
+    await expect(engine.schedule(tick, { job: "rollup" }, { every: -1 })).rejects.toThrow(RangeError);
+  });
+
+  it("starts an ordinary run: a worker picks it up and it replays like any other", async () => {
+    const { engine, drain } = harness([tick]);
+
+    const { runId } = await engine.schedule(tick, { job: "rollup" }, { every: 60_000 });
+    await drain();
+    const view = await engine.view(runId);
+
+    expect(view?.status).toBe("completed");
+    expect(view?.output).toBe("did rollup");
+    expect(view?.timeline.map((e) => e.type)).toEqual(["step.completed"]);
   });
 });
