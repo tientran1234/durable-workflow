@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-29
+
+- Scheduled starts: `engine.schedule(workflow, input, { every })` with idempotent run ids per period, so the loop that starts a run every hour no longer has to remember the last tick — the run id is derived from the schedule and the period, and every worker can drive the same schedule at once for one run per period.
+
 ## 2026-09-28
 
 - Lifecycle hooks: `onRunCompleted`, `onRunFailed`, `onStepFailed` for metrics and alerting, so counting durations and paging on a failure no longer means polling `engine.list` — each fires after the write it reports, once per terminal run and once per failed step attempt, and cannot fail the run it describes.

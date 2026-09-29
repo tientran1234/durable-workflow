@@ -155,6 +155,52 @@ step does not need a bump; the step's recorded result is what replay uses.
 Getting that judgement wrong is not silent: shipping a changed body under the
 same version still fails the run with `NondeterminismError` naming both names.
 
+## Schedules
+
+Something has to start a run every hour. The hard part is not the timer: it is
+that the loop holding it has no memory. A retried tick, a process that restarts
+and fires its interval early, or a second worker running the same loop each
+start another run for an hour that already ran.
+
+```ts
+const rollup = defineWorkflow<{ job: string }, void>("rollup", async (ctx) => {
+  const rows = await ctx.step("collect", () => warehouse.scan());
+  await ctx.step("publish", () => warehouse.publish(rows));
+});
+
+// In every worker process, in whatever loop already runs there.
+setInterval(() => void engine.schedule(rollup, { job: "daily" }, { every: 3600_000 }), 30_000);
+```
+
+That is one run an hour between all of them, at any call frequency, because
+the run's id is `${name}@${periodStart}` — derived from the schedule and the
+period rather than generated. A call that finds a run already under that id has
+its answer without writing anything, which is what makes the loop disposable:
+an interval, a cron entry, every worker at once, none of them remembering the
+last tick. The return value says which run the period got and whether this call
+is the one that started it:
+
+```ts
+const { runId, periodStart, created } = await engine.schedule(rollup, input, { every: 3600_000 });
+```
+
+Periods are measured from the epoch, not from the first call, so processes that
+never speak agree on the boundaries: `every: 3600_000` is the top of each hour
+and `every: 86_400_000` is UTC midnight, on a worker that started yesterday and
+one that started a second ago. `name` separates two schedules over one
+workflow; without it they share the workflow's name, and therefore a run.
+
+A scheduled run is an ordinary run — it retries, waits for signals, and shows
+up in `engine.list` and `engine.view` — and the schedule does not wait for it.
+The next period starts a new run whether or not this one has finished. Where
+two must not overlap, the workflow is what knows: start it with a step that
+checks.
+
+Nothing about the schedule itself is stored. The period's run *is* the record
+that the period fired, which is what a call reads to decide, so changing
+`every` or removing the schedule is a deploy rather than a migration — and a
+period nobody called during is skipped, not backfilled.
+
 ## Inspecting runs
 
 `engine.list` pages over runs, newest first; `engine.view` renders one run for
@@ -355,14 +401,15 @@ src/
   view.ts         a run rendered for an admin screen: blockedOn + history as a timeline
   children.ts     how a parent names its child and the signal the engine answers on
   hooks.ts        the lifecycle payloads, and the call that cannot fail a run
+  schedule.ts     the period a clock reading falls in, and the id that period's run takes
   stores/memory.ts
   stores/sqlite.ts     the same record on a file: one writer, so claiming is one statement
   stores/postgres.ts   JSONB record + mirrored query columns + SKIP LOCKED claim
 tests/
-  engine.test.ts        57 tests with a hand-driven clock: memoisation, durable
+  engine.test.ts        66 tests with a hand-driven clock: memoisation, durable
                         backoff, early signals, timeouts, nondeterminism, leases,
-                        listing, the run view, child runs, compaction and the
-                        lifecycle hooks
+                        listing, the run view, child runs, compaction, the
+                        lifecycle hooks and scheduled starts
   sqlite.test.ts        9 tests on a real file: a run resumed after the process
                         that started it is gone, stale writes, leases across two
                         connections, keyset paging
@@ -394,5 +441,9 @@ CI runs the full suite, Postgres included, on every push.
 - **Durable hook delivery.** A lifecycle hook is an in-process call made after
   the write it reports; a worker that dies in between emits nothing, and nothing
   replays it. A side effect that must not be lost goes in the workflow as a step.
-- **Scheduling / cron.** Call `engine.start` from whatever already runs on a
-  schedule.
+- **Calling `engine.schedule` on time, and calendar schedules.** A schedule is
+  a fixed period measured from the epoch plus the run id derived from it; the
+  loop that calls it on time is still whatever you already run. What a period
+  cannot say, a cron expression can — the last weekday of a month, a local
+  timezone that observes DST — and that arithmetic stays on your side of
+  `every`.

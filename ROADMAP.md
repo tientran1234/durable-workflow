@@ -8,4 +8,4 @@ One item per pull request, in order.
 - [x] History compaction for long runs: snapshot the completed prefix so replay cost stops growing.
 - [x] SQLite store (`better-sqlite3`, optional peer) for single-node deployments and tests without Postgres.
 - [x] Lifecycle hooks: `onRunCompleted`, `onRunFailed`, `onStepFailed` for metrics and alerting.
-- [ ] Scheduled starts: `engine.schedule(workflow, input, { every })` with idempotent run ids per period.
+- [x] Scheduled starts: `engine.schedule(workflow, input, { every })` with idempotent run ids per period.
