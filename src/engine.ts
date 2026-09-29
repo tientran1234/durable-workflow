@@ -113,7 +113,19 @@ export class Engine {
     const periodStart = schedulePeriod(this.now(), options.every);
     const name = options.name ?? (typeof workflow === "string" ? workflow : workflow.name);
     const runId = scheduleRunId(name, periodStart);
-    throw new Error(`engine.schedule is not implemented yet (would be run ${runId})`);
+
+    if (await this.store.get(runId)) return { runId, periodStart, created: false };
+    try {
+      await this.start(workflow, input, { id: runId });
+    } catch (err) {
+      // Another caller created the period's run between that read and this
+      // write. The id is the primary key in every store, so the loser of the
+      // race lands here rather than starting the period a second time — but
+      // only a duplicate explains it, so anything else is still an error.
+      if (!(await this.store.get(runId))) throw err;
+      return { runId, periodStart, created: false };
+    }
+    return { runId, periodStart, created: true };
   }
 
   get(id: string): Promise<RunRecord | null> {
