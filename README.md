@@ -51,6 +51,91 @@ in microseconds and resumes exactly where it was.
 waiting for, persist, and unwind the function by throwing a control-flow
 sentinel. The run costs nothing until a signal arrives or the timer is due.
 
+## Sagas
+
+A step that fails for good throws `StepFailedError` *into* the workflow
+function, so the smallest saga is a `try`/`catch` that runs the undo itself:
+
+```ts
+try {
+  await ctx.step("ship", () => courier.book(orderId));
+} catch (err) {
+  if (!(err instanceof StepFailedError)) throw err;
+  await ctx.step("refund", () => stripe.refund(payment.id));
+  return "refunded";
+}
+```
+
+That stops scaling at the second thing to undo. Four steps in, the catch block
+has to know which of them got as far as happening, undo them in the right order,
+give each undo its own retries — and do all of it again from the top when the
+worker running the catch block dies halfway through.
+
+`ctx.compensate` puts the undo next to the work it reverses instead:
+
+```ts
+const fulfilment = defineWorkflow<{ orderId: string }, string>("fulfilment", async (ctx, { orderId }) => {
+  const hold = await ctx.step("reserve", () => inventory.hold(orderId));
+  ctx.compensate("release", () => inventory.release(hold.id));
+
+  const payment = await ctx.step("charge", () => stripe.charge(orderId));
+  ctx.compensate("refund", () => stripe.refund(payment.id), { retry: { maxAttempts: 10 } });
+
+  await ctx.step("ship", () => courier.book(orderId));    // throws after its last attempt
+  return "shipped";
+});
+```
+
+If `ship` fails for good and nothing catches it, the engine runs `refund` and
+then `release`, and only then fails the run. Each undo is a durable step of its
+own: it happens at most once, retries under its own policy, and its backoff is a
+persisted wake time — so a worker that dies between `refund` and `release`
+replays into the phase and carries on rather than refunding twice.
+
+Newest first because a saga is a stack: the later work was done on top of the
+earlier, so undoing outwards is the only order in which each undo finds the
+state it was registered against.
+
+**Registering records nothing.** `ctx.compensate` does not suspend and writes no
+history event, which is why there is nothing to await: replay re-registers by
+re-executing, so the undos that exist are exactly the ones the run reached. A
+registration that took a call position of its own would be a position that never
+settles, and compaction would stop folding at the first one.
+
+**The failure has to escape the function.** A `try`/`catch` that handles a step
+failure is the workflow saying it has another path, so nothing is undone — the
+two styles do not fight, and the hand-written one above still works unchanged.
+What runs the undos is the run failing.
+
+**`fn` is not a workflow.** It runs inside a durable unit, so it must not call
+`ctx.*`: those calls have no position of their own, and the phase is past the
+point where the function could suspend.
+
+**An undo that gives up does not stop the rest.** After its last attempt the
+phase moves to the next registration: the work below it is still done, and
+abandoning that would leave more of the saga applied rather than less. The run
+then fails naming the cause and every undo that did not happen.
+
+```
+step "ship" failed after 3 attempt(s): courier down; compensation did not complete: "refund" (gateway down)
+```
+
+**Nothing is undone when replay and the code disagree.** A `NondeterminismError`
+means the history and the function no longer describe the same run, so which
+undos it owes is precisely what neither can say. The run fails without
+compensating.
+
+Undos are their own events rather than steps, so `engine.view` shows them as
+such — `compensation "refund" completed` — and a run sleeping on an undo's
+backoff says so:
+
+```ts
+// blockedOn: { kind: "retry", name: "refund", until: 1800000001000 }
+```
+
+Registrations do not cross a handover: `ctx.continueAsNew` starts a run with an
+empty history, so what the successor should undo is part of what you hand it.
+
 ## Child workflows
 
 A child workflow is an ordinary run that reports back to the run that started
@@ -415,8 +500,10 @@ rather than recording a completion that never happened.
 
 **Step failures are ordinary exceptions inside the workflow.** After the last
 attempt, `ctx.step` throws `StepFailedError` *into the workflow function*, so
-compensation is plain code: catch it, run a `refund` step, return. Sagas need no
-extra API.
+compensation can be plain code: catch it, run a `refund` step, return. What
+`ctx.compensate` adds is only the part of that which stops scaling — reverse
+order, one durable undo per registration, retries per undo — for the case where
+the failure is left to escape.
 
 ## Stores
 
@@ -464,6 +551,7 @@ src/
   compaction.ts   folding a settled history prefix into a snapshot replay indexes
   view.ts         a run rendered for an admin screen: blockedOn + history as a timeline
   children.ts     how a parent names its child and the signal the engine answers on
+  saga.ts         the undos a failing run owes, newest first, and how it reports them
   hooks.ts        the lifecycle payloads, and the call that cannot fail a run
   schedule.ts     the period a clock reading falls in, and the id that period's run takes
   continuation.ts a chain's root, a run's generation, and the id the next one takes
@@ -471,10 +559,11 @@ src/
   stores/sqlite.ts     the same record on a file: one writer, so claiming is one statement
   stores/postgres.ts   JSONB record + mirrored query columns + SKIP LOCKED claim
 tests/
-  engine.test.ts        75 tests with a hand-driven clock: memoisation, durable
+  engine.test.ts        85 tests with a hand-driven clock: memoisation, durable
                         backoff, early signals, timeouts, nondeterminism, leases,
                         listing, the run view, child runs, compaction, the
-                        lifecycle hooks, scheduled starts and continuations
+                        lifecycle hooks, scheduled starts, continuations and
+                        saga compensation
   sqlite.test.ts        9 tests on a real file: a run resumed after the process
                         that started it is gone, stale writes, leases across two
                         connections, keyset paging
@@ -508,6 +597,11 @@ CI runs the full suite, Postgres included, on every push.
   generation needs to be handed. There is no `engine.continueAsNew`; cancelling
   a run and starting another is that, without the pretence that the two are one
   piece of work.
+- **Compensating a canceled run.** `engine.cancel` marks a run canceled without
+  executing it, and the undos a run owes only exist inside a pass that replays
+  its function, so cancelling undoes nothing. Unwinding a saga on purpose is a
+  decision about state that the workflow has to make: signal it, and let the
+  function take the path that ends the run itself.
 - **Durable hook delivery.** A lifecycle hook is an in-process call made after
   the write it reports; a worker that dies in between emits nothing, and nothing
   replays it. A side effect that must not be lost goes in the workflow as a step.

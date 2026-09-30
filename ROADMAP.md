@@ -15,7 +15,7 @@ One item per pull request, in order.
 
 Same rule: one item per change, in order.
 
-- [ ] Saga compensation: `ctx.compensate(name, fn)` registers an undo for the step just completed; when a later step fails for good, compensations run in reverse order, each as a durable step with its own retries.
+- [x] Saga compensation: `ctx.compensate(name, fn)` registers an undo for the step just completed; when a later step fails for good, compensations run in reverse order, each as a durable step with its own retries.
 - [ ] Typed signals: `defineSignal("approve", zodSchema)` so `waitFor` returns the parsed type and `engine.signal` rejects invalid payloads before they touch history; the rejection is recorded on the run.
 - [ ] Step timeouts: `ctx.step(name, fn, { timeoutMs })` — a hung step becomes a retryable failure with its own history event instead of a lease that expires silently.
 - [ ] Tags and search: `engine.start(wf, input, { tags })` and `engine.list({ tag })`, indexed on both stores, so an operator finds the run for order X without knowing its id.

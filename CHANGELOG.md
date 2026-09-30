@@ -2,6 +2,7 @@
 
 ## 2026-09-30
 
+- Saga compensation: `ctx.compensate(name, fn)` registers an undo for the step just completed, and when a later step fails for good the registrations run in reverse order, each as a durable step with its own retries — so unwinding a half-applied saga no longer means a catch block that has to know which steps got as far as happening, and a worker that dies mid-undo replays into the phase instead of undoing twice.
 - Continuations: `ctx.continueAsNew(input)` ends a long run and hands the work to a fresh one with an empty history, with derived ids per generation — so a run that never ends stops carrying the results replay has already settled, and a signal, a cancellation or a waiting parent still reaches the generation that is running.
 
 ## 2026-09-29
