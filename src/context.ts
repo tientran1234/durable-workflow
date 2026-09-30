@@ -1,5 +1,6 @@
 import { childHandle, childRunId } from "./children.js";
 import { nextSeq, snapshotEvent } from "./compaction.js";
+import { chainRoot, continuationRunId, runGeneration } from "./continuation.js";
 import { ChildFailedError, NondeterminismError, StepFailedError, Suspend, WaitTimeoutError, errorMessage } from "./errors.js";
 import { type LifecycleHooks, notify, runEvent } from "./hooks.js";
 import { DEFAULT_RETRY, backoffMs } from "./retry.js";
@@ -217,6 +218,12 @@ export function createContext<Input>(run: RunRecord, deps: ContextDeps): ReplayC
       run.wakeAt = deps.now() + ms;
       run.pendingTimer = { name, call: c };
       return suspend();
+    },
+
+    async continueAsNew(input: Input): Promise<never> {
+      void input;
+      const successor = continuationRunId(chainRoot(run), runGeneration(run) + 1);
+      throw new Error(`ctx.continueAsNew is not implemented yet (would be run ${successor})`);
     },
   };
 

@@ -1,6 +1,6 @@
 import { DEFAULT_VERSION } from "./versions.js";
 
-export type RunStatus = "running" | "sleeping" | "waiting" | "completed" | "failed" | "canceled";
+export type RunStatus = "running" | "sleeping" | "waiting" | "completed" | "failed" | "canceled" | "continued";
 
 /**
  * The append-only record of everything a run has decided. Replay reads it;
@@ -52,6 +52,18 @@ export interface RunRecord {
   input: unknown;
   /** Set when ctx.startChild created this run: where to deliver its outcome. */
   parent: { runId: string; signal: string } | null;
+  /**
+   * Where this run sits in a continuation chain, when ctx.continueAsNew
+   * created it. Absent on a run that was started directly, which is
+   * generation 1 of its own chain.
+   */
+  chain?: { root: string; generation: number };
+  /**
+   * Set when this run ended by continuing: the successor that carries the work
+   * on. The run is terminal, but the chain is not finished, which is why a
+   * signal or a cancellation addressed to it is forwarded to the successor.
+   */
+  continuation?: { runId: string };
   status: RunStatus;
   history: HistoryEvent[];
   /**
@@ -117,6 +129,16 @@ export interface WorkflowContext<Input> {
   waitFor<T = unknown>(name: string, options?: { timeoutMs?: number }): Promise<T>;
   /** A durable timer: survives restarts, costs nothing while pending. */
   sleep(name: string, ms: number): Promise<void>;
+  /**
+   * End this run and hand the work to a fresh run of the same workflow with
+   * `input` — an empty history, so replay stops paying for what is already
+   * settled. Never returns: it unwinds the function the way waitFor does.
+   *
+   * The successor starts on the newest registered version, and anything still
+   * addressing this run (a signal, a cancellation, the parent that is waiting
+   * on it) reaches the successor instead.
+   */
+  continueAsNew(input: Input): Promise<never>;
   /**
    * Start `workflow` as an independent run, at most once per parent run, and
    * return a handle to wait on. The child runs on its own; this does not block.

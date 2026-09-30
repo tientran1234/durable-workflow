@@ -1,6 +1,6 @@
 import type { RunRecord, RunStatus } from "./types.js";
 
-export const TERMINAL: ReadonlySet<RunStatus> = new Set(["completed", "failed", "canceled"]);
+export const TERMINAL: ReadonlySet<RunStatus> = new Set(["completed", "failed", "canceled", "continued"]);
 
 /** Should a worker pick this run up at `now`? Leases are checked separately. */
 export function isDue(run: Pick<RunRecord, "status" | "wakeAt">, now: number): boolean {

@@ -34,6 +34,9 @@ export type {
   StepFailedEvent,
 } from "./hooks.js";
 
+// Continuations: where a run sits in a chain, and the id the next generation takes.
+export { chainRoot, continuationRunId, runGeneration } from "./continuation.js";
+
 // Scheduled starts: the period a call falls in and the run id that period takes.
 export { schedulePeriod, scheduleRunId } from "./schedule.js";
 export type { ScheduleOptions, ScheduledRun } from "./schedule.js";

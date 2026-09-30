@@ -1,4 +1,5 @@
 import { historyEvents } from "./compaction.js";
+import { chainRoot, runGeneration } from "./continuation.js";
 import { TERMINAL } from "./due.js";
 import type { HistoryEvent, RunRecord, RunStatus } from "./types.js";
 import { runVersion } from "./versions.js";
@@ -34,6 +35,13 @@ export interface RunView {
   /** The version this run replays on — which code an operator is looking at. */
   workflowVersion: number;
   status: RunStatus;
+  /**
+   * Which generation of a continuation chain this run is, and the id the chain
+   * started under — so an operator handed any id can find the rest of it.
+   */
+  chain: { root: string; generation: number };
+  /** Set when the run ended by continuing: the generation the work went to. */
+  continuation: { runId: string } | null;
   createdAt: number;
   updatedAt: number;
   /** Start to last persisted change. For a live run this grows with every tick. */
@@ -59,6 +67,8 @@ export function renderRun(run: RunRecord): RunView {
     workflow: run.workflow,
     workflowVersion: runVersion(run),
     status: run.status,
+    chain: { root: chainRoot(run), generation: runGeneration(run) },
+    continuation: run.continuation ?? null,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
     durationMs: run.updatedAt - run.createdAt,

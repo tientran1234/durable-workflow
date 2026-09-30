@@ -1206,3 +1206,159 @@ describe("scheduled starts", () => {
     expect(view?.timeline.map((e) => e.type)).toEqual(["step.completed"]);
   });
 });
+
+describe("continuations", () => {
+  /** A run that would otherwise grow forever: one step per batch, continuing after each. */
+  const batches = defineWorkflow<{ left: number; done: number }, number>("batches", async (ctx, input) => {
+    const done = await ctx.step("batch", () => input.done + 1);
+    return input.left > 1 ? ctx.continueAsNew({ left: input.left - 1, done }) : done;
+  });
+
+  it("ends the run and carries the work on in a successor with an empty history", async () => {
+    const { engine, drain } = harness([batches]);
+    await engine.start(batches, { left: 3, done: 0 }, { id: "r1" });
+    await drain();
+
+    const first = await engine.get("r1");
+    expect(first?.status).toBe("continued");
+    expect(first?.continuation).toEqual({ runId: "r1~2" });
+    expect(first?.output).toBeUndefined();
+
+    const second = await engine.get("r1~2");
+    expect(second?.chain).toEqual({ root: "r1", generation: 2 });
+    expect(second?.input).toEqual({ left: 2, done: 1 });
+
+    const last = await engine.get("r1~3");
+    expect(last?.status).toBe("completed");
+    expect(last?.output).toBe(3);
+
+    // Each generation replays its own history and nothing else, which is the
+    // whole point: three batches, one event apiece.
+    expect([first, second, last].map((r) => r?.history.length)).toEqual([1, 1, 1]);
+    expect((await engine.list({ status: "continued" })).runs.map((r) => r.id)).toEqual(["r1~2", "r1"]);
+  });
+
+  it("continues once when a crash lost the record of the handover", async () => {
+    const { engine, store, drain } = harness([batches]);
+    await engine.start(batches, { left: 2, done: 0 }, { id: "r1" });
+    await engine.tick("r1"); // creates the successor, then records the handover
+
+    // Rewind to the instant before that was persisted: the successor exists,
+    // the run has no memory of handing over.
+    const first = (await store.get("r1"))!;
+    first.status = "running";
+    delete first.continuation;
+    await store.save(first, first.version);
+
+    await drain();
+    expect(store.all().map((r) => r.id).sort()).toEqual(["r1", "r1~2"]);
+    expect((await engine.get("r1"))?.continuation).toEqual({ runId: "r1~2" });
+    expect((await engine.get("r1~2"))?.output).toBe(2);
+  });
+
+  it("starts the successor on the newest version, so an endless run can cross a deploy", async () => {
+    const v1 = defineWorkflow<number, string>("rolling", async (ctx, n) =>
+      n > 0 ? ctx.continueAsNew(n - 1) : "v1",
+    );
+    const v2 = defineWorkflow<number, string>("rolling", async (ctx, n) => (n > 0 ? ctx.continueAsNew(n - 1) : "v2"), {
+      version: 2,
+    });
+    const { engine, drain } = harness([v1, v2]);
+    await engine.start(v1, 1, { id: "r1" }); // pinned to version 1
+    await drain();
+
+    expect((await engine.get("r1"))?.workflowVersion).toBe(1);
+    expect((await engine.get("r1~2"))?.workflowVersion).toBe(2);
+    expect((await engine.get("r1~2"))?.output).toBe("v2");
+  });
+
+  it("hands the parent the chain's outcome, not the generation that continued", async () => {
+    const relay = defineWorkflow<number, string>("relay", async (ctx, n) => (n > 0 ? ctx.continueAsNew(n - 1) : "relayed"));
+    const supervisor = defineWorkflow<null, string>("relay-parent", async (ctx) => {
+      const handle = await ctx.startChild(relay, 2);
+      return ctx.waitForChild(handle);
+    });
+    const { engine, drain } = harness([supervisor, relay]);
+    await engine.start(supervisor, null, { id: "p1" });
+    await drain();
+
+    expect((await engine.get("p1"))?.output).toBe("relayed");
+    // The link moves with the work, so the generation that finished reports on
+    // the signal the parent has been waiting on since the child started.
+    expect((await engine.get("p1#0"))?.status).toBe("continued");
+    expect((await engine.get("p1#0~3"))?.parent).toEqual({ runId: "p1", signal: "child:p1#0" });
+  });
+
+  it("forwards a signal sent to a run that has since continued", async () => {
+    const wf = defineWorkflow<number, string>("shift", async (ctx, n) =>
+      n > 0 ? ctx.continueAsNew(n - 1) : ctx.waitFor<string>("handover"),
+    );
+    const { engine, drain } = harness([wf]);
+    await engine.start(wf, 1, { id: "r1" });
+    await drain();
+    expect((await engine.get("r1~2"))?.status).toBe("waiting");
+
+    await engine.signal("r1", "handover", "baton"); // the id the caller still holds
+    expect((await engine.get("r1~2"))?.output).toBe("baton");
+  });
+
+  it("carries a signal that arrived before the handover over to the successor", async () => {
+    const wf = defineWorkflow<number, string>("mailbox", async (ctx, n) => {
+      if (n === 0) return ctx.waitFor<string>("mail");
+      await ctx.sleep("gather", 1_000);
+      return ctx.continueAsNew(n - 1);
+    });
+    const { engine, drain, advance } = harness([wf]);
+    await engine.start(wf, 1, { id: "r1" });
+    await drain(); // generation 1 is asleep
+    await engine.signal("r1", "mail", "letter"); // buffered: nothing is waiting for it yet
+    expect((await engine.get("r1"))?.pendingSignals).toEqual({ mail: ["letter"] });
+
+    advance(1_000);
+    await drain();
+    expect((await engine.get("r1"))?.pendingSignals).toEqual({});
+    expect((await engine.get("r1~2"))?.output).toBe("letter");
+  });
+
+  it("cancels the generation that is running, whichever id the caller has", async () => {
+    const wf = defineWorkflow<number, void>("patient", async (ctx, n) => {
+      if (n > 0) return ctx.continueAsNew(n - 1);
+      await ctx.waitFor("never");
+    });
+    const { engine, drain } = harness([wf]);
+    await engine.start(wf, 1, { id: "r1" });
+    await drain();
+
+    const canceled = await engine.cancel("r1");
+    expect(canceled.id).toBe("r1~2");
+    expect(canceled.status).toBe("canceled");
+    expect((await engine.get("r1"))?.status).toBe("continued");
+  });
+
+  it("reports one completion for the chain, not one per generation", async () => {
+    const completed: RunCompletedEvent[] = [];
+    const wf = defineWorkflow<number, string>("counted-chain", async (ctx, n) =>
+      n > 0 ? ctx.continueAsNew(n - 1) : "done",
+    );
+    const { engine, drain } = harness([wf], { hooks: { onRunCompleted: (e) => void completed.push(e) } });
+    await engine.start(wf, 2, { id: "r1" });
+    await drain();
+
+    expect(completed.map((e) => e.runId)).toEqual(["r1~3"]);
+  });
+
+  it("shows an operator which generation a run is and where the work went", async () => {
+    const { engine, drain } = harness([batches]);
+    await engine.start(batches, { left: 2, done: 0 }, { id: "r1" });
+    await drain();
+
+    const first = await engine.view("r1");
+    expect(first?.chain).toEqual({ root: "r1", generation: 1 });
+    expect(first?.continuation).toEqual({ runId: "r1~2" });
+    expect(first?.blockedOn).toBeNull();
+
+    const second = await engine.view("r1~2");
+    expect(second?.chain).toEqual({ root: "r1", generation: 2 });
+    expect(second?.continuation).toBeNull();
+  });
+});
