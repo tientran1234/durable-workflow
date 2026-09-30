@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { childOutcome } from "./children.js";
 import { DEFAULT_COMPACT_AFTER, compactHistory } from "./compaction.js";
-import { appendEvent, createContext } from "./context.js";
+import { type ReplayContext, appendEvent, createContext } from "./context.js";
 import { chainRoot, continuationRunId, runGeneration } from "./continuation.js";
 import { TERMINAL, isDue } from "./due.js";
 import {
@@ -13,6 +13,7 @@ import {
 } from "./errors.js";
 import { type LifecycleHooks, notify, runEvent } from "./hooks.js";
 import { DEFAULT_RETRY } from "./retry.js";
+import { compensatedError, runCompensations } from "./saga.js";
 import { type ScheduleOptions, type ScheduledRun, schedulePeriod, scheduleRunId } from "./schedule.js";
 import type { ChildHandle, RetryPolicy, RunPage, RunQuery, RunRecord, RunStore, WorkflowDefinition } from "./types.js";
 import { type RunView, renderRun } from "./view.js";
@@ -309,8 +310,7 @@ export class Engine {
       } else if (err instanceof ConflictError) {
         throw err;
       } else {
-        run.status = "failed";
-        run.error = errorMessage(err);
+        await this.fail(run, ctx, err);
       }
     }
 
@@ -324,6 +324,32 @@ export class Engine {
       await this.notifyParent(run);
     }
     return run;
+  }
+
+  /**
+   * Turn a failure that escaped the workflow function into the run's outcome,
+   * undoing on the way out what the run registered with ctx.compensate.
+   *
+   * The undos run before the status is set, so a run is never seen as failed
+   * while they are still outstanding: the phase suspends on a backoff like any
+   * other durable unit, and the run stays asleep until it is through.
+   *
+   * Nondeterminism is the exception. The code and the history disagree, so which
+   * undos the run owes is precisely what cannot be established from either —
+   * undoing off that history would be guesswork about what actually ran.
+   */
+  private async fail(run: RunRecord, ctx: ReplayContext<unknown>, err: unknown): Promise<void> {
+    const cause = errorMessage(err);
+    if (err instanceof NondeterminismError || ctx.compensations.length === 0) {
+      run.status = "failed";
+      run.error = cause;
+      return;
+    }
+
+    const report = await runCompensations(ctx);
+    if (report.suspended) return; // asleep on an undo's backoff, already persisted
+    run.status = "failed";
+    run.error = compensatedError(cause, report);
   }
 
   /**

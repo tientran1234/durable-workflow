@@ -18,11 +18,12 @@ export function nextSeq(run: Pick<RunRecord, "history" | "snapshot">): number {
 
 /**
  * Does this event settle its ctx call — is it what replay returns or throws? A
- * `step.failed` carrying `retryAt` settles nothing: the step is going to run
- * again, and its attempt count is derived from those events.
+ * failure carrying `retryAt` settles nothing: the step or the undo is going to
+ * run again, and its attempt count is derived from those events.
  */
 function settles(event: HistoryEvent): boolean {
-  return event.type !== "step.failed" || event.retryAt === undefined;
+  if (event.type === "step.failed" || event.type === "compensation.failed") return event.retryAt === undefined;
+  return true;
 }
 
 /**

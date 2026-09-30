@@ -103,10 +103,13 @@ function blockedOn(run: RunRecord): RunBlockedOn | null {
   }
   if (run.status === "sleeping") {
     if (run.pendingTimer) return { kind: "timer", name: run.pendingTimer.name, until: run.wakeAt };
-    // Sleeping with no timer means a step is serving out its retry backoff,
-    // which lives in history rather than on the record.
-    const failed = [...run.history].reverse().find((e) => e.type === "step.failed" && e.retryAt !== undefined);
-    if (failed) return { kind: "retry", name: failed.name, until: run.wakeAt };
+    // Sleeping with no timer means a step, or an undo the run is compensating
+    // with, is serving out its retry backoff — which lives in history rather
+    // than on the record.
+    const retrying = [...run.history]
+      .reverse()
+      .find((e) => (e.type === "step.failed" || e.type === "compensation.failed") && e.retryAt !== undefined);
+    if (retrying) return { kind: "retry", name: retrying.name, until: run.wakeAt };
   }
   return null;
 }

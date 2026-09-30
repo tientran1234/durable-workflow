@@ -1,6 +1,14 @@
 import { childHandle, childRunId } from "./children.js";
 import { nextSeq, snapshotEvent } from "./compaction.js";
-import { ChildFailedError, NondeterminismError, StepFailedError, Suspend, WaitTimeoutError, errorMessage } from "./errors.js";
+import {
+  ChildFailedError,
+  CompensationFailedError,
+  NondeterminismError,
+  StepFailedError,
+  Suspend,
+  WaitTimeoutError,
+  errorMessage,
+} from "./errors.js";
 import { type LifecycleHooks, notify, runEvent } from "./hooks.js";
 import { DEFAULT_RETRY, backoffMs } from "./retry.js";
 import type {
@@ -19,6 +27,57 @@ import type {
 /** Append to history with the next sequence number. Used by the context and the engine. */
 export function appendEvent(run: RunRecord, event: NewEvent, now: number): void {
   run.history.push({ ...event, seq: nextSeq(run), at: now } as HistoryEvent);
+}
+
+/**
+ * Which pair of history events a durable unit records: the work a workflow
+ * asked for, or an undo the engine ran because the run failed. Keeping them
+ * apart is what stops a timeline reading an undo as the work it reversed.
+ */
+type DurableKind = "step" | "compensation";
+
+const COMPLETED = { step: "step.completed", compensation: "compensation.completed" } as const;
+const FAILED = { step: "step.failed", compensation: "compensation.failed" } as const;
+
+/** The two events that carry an attempt number and a backoff. */
+type FailureEvent = Extract<HistoryEvent, { type: "step.failed" | "compensation.failed" }>;
+
+function completedEvent(kind: DurableKind, call: number, name: string, result: unknown): NewEvent {
+  // An undo records no result: nothing downstream reads what an undo returned.
+  return kind === "step"
+    ? { call, type: "step.completed", name, result }
+    : { call, type: "compensation.completed", name };
+}
+
+function failedEvent(
+  kind: DurableKind,
+  call: number,
+  name: string,
+  attempt: number,
+  error: string,
+  retryAt: number | undefined,
+): NewEvent {
+  const backoff = retryAt !== undefined ? { retryAt } : {};
+  return kind === "step"
+    ? { call, type: "step.failed", name, attempt, error, ...backoff }
+    : { call, type: "compensation.failed", name, attempt, error, ...backoff };
+}
+
+/**
+ * What a unit throws once its policy is spent. A step's failure goes to the
+ * workflow function; an undo's has nowhere to go but the engine, which is the
+ * whole difference between them.
+ */
+function exhausted(
+  kind: DurableKind,
+  name: string,
+  attempt: number,
+  error: string,
+  options?: { cause?: unknown },
+): Error {
+  return kind === "step"
+    ? new StepFailedError(name, attempt, error, options)
+    : new CompensationFailedError(name, attempt, error, options);
 }
 
 export interface ContextDeps {
@@ -50,6 +109,8 @@ export interface ReplayContext<Input> extends WorkflowContext<Input> {
    * engine runs them when the pass ends in a failure; see src/saga.ts.
    */
   readonly compensations: readonly Compensation[];
+  /** Run one of those undos as a durable unit of its own. */
+  undo(compensation: Compensation): Promise<void>;
 }
 
 /**
@@ -90,6 +151,77 @@ export function createContext<Input>(run: RunRecord, deps: ContextDeps): ReplayC
     throw new Suspend();
   };
 
+  /**
+   * The frontier of one durable unit — a ctx.step, or one of the undos the
+   * engine runs when a pass ends in a failure. Both memoise their outcome by
+   * call position, derive their attempt count from history and serve their
+   * backoff as a persisted wake time, so the kind decides only which events they
+   * record and which error they throw once the policy is spent.
+   */
+  const runDurable = async <T>(
+    kind: DurableKind,
+    c: number,
+    name: string,
+    fn: () => Promise<T> | T,
+    options: StepOptions | undefined,
+  ): Promise<T> => {
+    const completed = at(c, [COMPLETED[kind]])[0];
+    if (completed) {
+      expectName(completed, name, kind);
+      return (completed.type === "step.completed" ? completed.result : undefined) as T;
+    }
+
+    const failures = at(c, [FAILED[kind]]) as FailureEvent[];
+    if (failures[0]) expectName(failures[0], name, kind);
+
+    const final = failures.find((f) => f.retryAt === undefined);
+    if (final) throw exhausted(kind, name, final.attempt, final.error);
+
+    const last = failures[failures.length - 1];
+    if (last?.retryAt !== undefined && last.retryAt > deps.now()) {
+      // Woken early (e.g. a direct tick) — go back to sleep until the backoff elapses.
+      run.status = "sleeping";
+      run.wakeAt = last.retryAt;
+      return suspend();
+    }
+
+    const attempt = failures.length + 1;
+    try {
+      const result = await fn();
+      push(completedEvent(kind, c, name, result));
+      await deps.persist(run);
+      return result;
+    } catch (err) {
+      const policy: RetryPolicy = { ...deps.defaultRetry, ...options?.retry };
+      const retryAt = attempt < policy.maxAttempts ? deps.now() + backoffMs(policy, attempt) : undefined;
+      const error = errorMessage(err);
+      push(failedEvent(kind, c, name, attempt, error, retryAt));
+
+      // Only the frontier gets here — a replay reads the attempt back out of
+      // history above — so an attempt is reported the once it happened.
+      const report = () =>
+        notify(deps.hooks.onStepFailed, {
+          ...runEvent(run, deps.now()),
+          kind,
+          step: name,
+          attempt,
+          error,
+          retryAt: retryAt ?? null,
+        });
+
+      if (retryAt === undefined) {
+        await deps.persist(run);
+        await report();
+        throw exhausted(kind, name, attempt, error, { cause: err });
+      }
+      // Durable backoff: the delay is a persisted wake time, not a setTimeout.
+      // A restart during the wait loses nothing.
+      run.status = "sleeping";
+      run.wakeAt = retryAt;
+      return suspend(report);
+    }
+  };
+
   const ctx: ReplayContext<Input> = {
     runId: run.id,
     input: run.input as Input,
@@ -101,63 +233,7 @@ export function createContext<Input>(run: RunRecord, deps: ContextDeps): ReplayC
     },
 
     async step<T>(name: string, fn: () => Promise<T> | T, options?: StepOptions): Promise<T> {
-      const c = call++;
-
-      const completed = at(c, ["step.completed"])[0];
-      if (completed && completed.type === "step.completed") {
-        expectName(completed, name, "step");
-        return completed.result as T;
-      }
-
-      const failures = at(c, ["step.failed"]) as Extract<HistoryEvent, { type: "step.failed" }>[];
-      if (failures[0]) expectName(failures[0], name, "step");
-
-      const final = failures.find((f) => f.retryAt === undefined);
-      if (final) throw new StepFailedError(name, final.attempt, final.error);
-
-      const last = failures[failures.length - 1];
-      if (last?.retryAt !== undefined && last.retryAt > deps.now()) {
-        // Woken early (e.g. a direct tick) — go back to sleep until the backoff elapses.
-        run.status = "sleeping";
-        run.wakeAt = last.retryAt;
-        return suspend();
-      }
-
-      const attempt = failures.length + 1;
-      try {
-        const result = await fn();
-        push({ call: c, type: "step.completed", name, result });
-        await deps.persist(run);
-        return result;
-      } catch (err) {
-        const policy: RetryPolicy = { ...deps.defaultRetry, ...options?.retry };
-        const retryAt = attempt < policy.maxAttempts ? deps.now() + backoffMs(policy, attempt) : undefined;
-        const error = errorMessage(err);
-        push({ call: c, type: "step.failed", name, attempt, error, ...(retryAt !== undefined ? { retryAt } : {}) });
-
-        // Only the frontier gets here — a replay reads the attempt back out of
-        // history above — so an attempt is reported the once it happened.
-        const report = () =>
-          notify(deps.hooks.onStepFailed, {
-            ...runEvent(run, deps.now()),
-            kind: "step",
-            step: name,
-            attempt,
-            error,
-            retryAt: retryAt ?? null,
-          });
-
-        if (retryAt === undefined) {
-          await deps.persist(run);
-          await report();
-          throw new StepFailedError(name, attempt, error, { cause: err });
-        }
-        // Durable backoff: the delay is a persisted wake time, not a setTimeout.
-        // A restart during the wait loses nothing.
-        run.status = "sleeping";
-        run.wakeAt = retryAt;
-        return suspend(report);
-      }
+      return runDurable("step", call++, name, fn, options);
     },
 
     compensate(name: string, fn: () => Promise<unknown> | unknown, options?: StepOptions): void {
@@ -166,6 +242,13 @@ export function createContext<Input>(run: RunRecord, deps: ContextDeps): ReplayC
       // an event of its own would stop compaction folding past it for the rest
       // of the run.
       compensations.push({ name, fn, ...(options ? { options } : {}) });
+    },
+
+    async undo(compensation: Compensation): Promise<void> {
+      // An undo takes a call position above everything the workflow function
+      // reached. The pass running it has already unwound, so those positions are
+      // as fixed across replays as the calls below them.
+      await runDurable("compensation", call++, compensation.name, compensation.fn, compensation.options);
     },
 
     async waitFor<T>(name: string, options?: { timeoutMs?: number }): Promise<T> {
