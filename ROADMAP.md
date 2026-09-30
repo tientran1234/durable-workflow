@@ -10,3 +10,14 @@ One item per pull request, in order.
 - [x] Lifecycle hooks: `onRunCompleted`, `onRunFailed`, `onStepFailed` for metrics and alerting.
 - [x] Scheduled starts: `engine.schedule(workflow, input, { every })` with idempotent run ids per period.
 - [x] Continuations: `ctx.continueAsNew(input)` ends a long run and hands the work to a fresh one, with derived ids per generation.
+
+## Batch 2 — set by the owner, 30 Sep 2026
+
+Same rule: one item per change, in order.
+
+- [ ] Saga compensation: `ctx.compensate(name, fn)` registers an undo for the step just completed; when a later step fails for good, compensations run in reverse order, each as a durable step with its own retries.
+- [ ] Typed signals: `defineSignal("approve", zodSchema)` so `waitFor` returns the parsed type and `engine.signal` rejects invalid payloads before they touch history; the rejection is recorded on the run.
+- [ ] Step timeouts: `ctx.step(name, fn, { timeoutMs })` — a hung step becomes a retryable failure with its own history event instead of a lease that expires silently.
+- [ ] Tags and search: `engine.start(wf, input, { tags })` and `engine.list({ tag })`, indexed on both stores, so an operator finds the run for order X without knowing its id.
+- [ ] Event-driven wakeups: Postgres `LISTEN/NOTIFY` on run changes so a worker wakes immediately on a signal or a due timer instead of waiting for the poll interval; polling stays as the fallback.
+- [ ] Dashboard: `engine.dashboard()` returns a single-file HTML handler (fetch-compatible) listing runs, rendering the timeline from `engine.view`, with a form to send a signal.
