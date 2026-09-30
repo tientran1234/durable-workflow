@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { childOutcome } from "./children.js";
 import { DEFAULT_COMPACT_AFTER, compactHistory } from "./compaction.js";
 import { appendEvent, createContext } from "./context.js";
+import { chainRoot, continuationRunId, runGeneration } from "./continuation.js";
 import { TERMINAL, isDue } from "./due.js";
 import {
   ConflictError,
@@ -70,7 +71,14 @@ export class Engine {
   async start<Input>(
     workflow: WorkflowDefinition<Input, unknown> | string,
     input: Input,
-    options: { id?: string; parent?: RunRecord["parent"] } = {},
+    options: {
+      id?: string;
+      parent?: RunRecord["parent"];
+      /** Set by ctx.continueAsNew: where this run sits in a continuation chain. */
+      chain?: RunRecord["chain"];
+      /** Set by ctx.continueAsNew: what the predecessor had buffered and never consumed. */
+      pendingSignals?: Record<string, unknown[]>;
+    } = {},
   ): Promise<string> {
     const definition =
       typeof workflow === "string" ? this.workflows.latest(workflow) : this.workflows.get(workflow.name, workflow.version);
@@ -81,9 +89,10 @@ export class Engine {
       workflowVersion: definition.version,
       input,
       parent: options.parent ?? null,
+      ...(options.chain ? { chain: options.chain } : {}),
       status: "running",
       history: [],
-      pendingSignals: {},
+      pendingSignals: options.pendingSignals ?? {},
       wakeAt: null,
       waitingFor: null,
       pendingTimer: null,
@@ -155,12 +164,17 @@ export class Engine {
     return this.execute(run);
   }
 
-  /** Tick while the run is due — through timers and retries whose time has come. For tests and one-shot scripts. */
+  /**
+   * Tick while the run is due — through timers and retries whose time has come,
+   * and on into the generations a continuation hands the work to. For tests and
+   * one-shot scripts.
+   */
   async settle(id: string, options: { maxTicks?: number } = {}): Promise<RunRecord> {
     const max = options.maxTicks ?? 100;
-    let run = await this.load(id);
+    let run = await this.live(id);
     for (let i = 0; i < max && !TERMINAL.has(run.status) && isDue(run, this.now()); i++) {
-      run = await this.tick(id);
+      await this.tick(run.id);
+      run = await this.live(run.id);
     }
     return run;
   }
@@ -171,8 +185,8 @@ export class Engine {
    * a signal that arrives early is not lost.
    */
   async signal(id: string, name: string, payload: unknown = null): Promise<RunRecord> {
-    const run = await this.load(id);
-    if (TERMINAL.has(run.status)) throw new Error(`run ${id} is ${run.status}; cannot signal`);
+    const run = await this.live(id);
+    if (TERMINAL.has(run.status)) throw new Error(`run ${run.id} is ${run.status}; cannot signal`);
 
     if (run.waitingFor?.name === name) {
       appendEvent(run, { call: run.waitingFor.call, type: "signal.received", name, payload }, this.now());
@@ -180,7 +194,7 @@ export class Engine {
       run.wakeAt = null;
       run.status = "running";
       await this.persist(run);
-      return this.tick(id);
+      return this.tick(run.id);
     }
 
     (run.pendingSignals[name] ??= []).push(payload);
@@ -189,7 +203,7 @@ export class Engine {
   }
 
   async cancel(id: string): Promise<RunRecord> {
-    const run = await this.load(id);
+    const run = await this.live(id);
     if (TERMINAL.has(run.status)) return run;
     run.status = "canceled";
     run.leaseUntil = null;
@@ -274,6 +288,7 @@ export class Engine {
       defaultRetry: this.defaultRetry,
       persist: (r) => this.persist(r),
       startChild: (target, input, handle) => this.startChildRun(run, target, input, handle),
+      continueAsNew: (input) => this.startContinuation(run, input),
       hooks: this.hooks,
     });
 
@@ -283,7 +298,7 @@ export class Engine {
         // The function returned even though a ctx call unwound it: user code
         // caught Suspend. The recorded history no longer matches what ran.
         throw new NondeterminismError(
-          "workflow returned after a suspension — a ctx.waitFor/sleep/step was wrapped in try/catch",
+          "workflow returned after a suspension — a ctx.waitFor/sleep/step/continueAsNew was wrapped in try/catch",
         );
       }
       run.status = "completed";
@@ -345,6 +360,38 @@ export class Engine {
   }
 
   /**
+   * Create the next generation behind ctx.continueAsNew, unless a pass that
+   * died before recording the handover already did, and return its id.
+   *
+   * It starts on the newest registered version rather than the one its
+   * predecessor is pinned to. A run that continues forever would otherwise
+   * never reach new code, and a handover is the one point in its life where no
+   * history has to survive the change — which is what makes it the place a
+   * deploy drains through.
+   *
+   * The successor is written before the handover is recorded, so a run that
+   * names a continuation always names one that exists.
+   */
+  private async startContinuation(run: RunRecord, input: unknown): Promise<string> {
+    const chain = { root: chainRoot(run), generation: runGeneration(run) + 1 };
+    const id = continuationRunId(chain.root, chain.generation);
+    if (!(await this.store.get(id))) {
+      await this.start(this.workflows.latest(run.workflow), input, {
+        id,
+        // The parent is owed the chain's outcome, not this generation's, so the
+        // link moves on with the work.
+        parent: run.parent,
+        chain,
+        // A signal that arrived before the handover was never consumed. Dropping
+        // it would make losing a signal a matter of which side of the handover
+        // it landed on.
+        pendingSignals: { ...run.pendingSignals },
+      });
+    }
+    return id;
+  }
+
+  /**
    * Tell a parent its child is done. It is an ordinary signal: a parent that has
    * not reached waitForChild yet buffers it, one that is waiting resumes now.
    * Retried on conflict because there is no caller to hand the error to, and a
@@ -353,6 +400,9 @@ export class Engine {
   private async notifyParent(child: RunRecord, attempts = 3): Promise<void> {
     const link = child.parent;
     if (!link) return;
+    // A continued run has not finished. The successor inherited the link, so it
+    // is the generation whose outcome the parent is owed.
+    if (child.continuation) return;
     const outcome = childOutcome(child);
 
     for (let attempt = 1; ; attempt++) {
@@ -368,6 +418,19 @@ export class Engine {
         if (!(err instanceof ConflictError) || attempt === attempts) throw err;
       }
     }
+  }
+
+  /**
+   * The generation at the end of a continuation chain. A continued run is a
+   * forwarding pointer: whoever holds an older id — an admin screen, a child
+   * about to report its outcome — is addressing the work, not the generation
+   * that happened to be running when they picked the id up.
+   */
+  private async live(id: string): Promise<RunRecord> {
+    let run = await this.load(id);
+    // Generations only ever count up, so this walks to an end.
+    while (run.continuation) run = await this.load(run.continuation.runId);
+    return run;
   }
 
   private async load(id: string): Promise<RunRecord> {

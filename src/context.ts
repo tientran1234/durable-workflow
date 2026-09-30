@@ -1,6 +1,5 @@
 import { childHandle, childRunId } from "./children.js";
 import { nextSeq, snapshotEvent } from "./compaction.js";
-import { chainRoot, continuationRunId, runGeneration } from "./continuation.js";
 import { ChildFailedError, NondeterminismError, StepFailedError, Suspend, WaitTimeoutError, errorMessage } from "./errors.js";
 import { type LifecycleHooks, notify, runEvent } from "./hooks.js";
 import { DEFAULT_RETRY, backoffMs } from "./retry.js";
@@ -32,6 +31,12 @@ export interface ContextDeps {
    * string, which starts it on the latest.
    */
   startChild: (target: { name: string; version?: number }, input: unknown, handle: ChildHandle) => Promise<void>;
+  /**
+   * Create the next generation of this run's chain and return its id.
+   * Idempotent, for the same reason startChild is: the id is derived, so a run
+   * already sitting under it is that successor.
+   */
+  continueAsNew: (input: unknown) => Promise<string>;
   /** Observers for metrics and alerting. The step frontier reports failed attempts. */
   hooks: LifecycleHooks;
 }
@@ -221,9 +226,21 @@ export function createContext<Input>(run: RunRecord, deps: ContextDeps): ReplayC
     },
 
     async continueAsNew(input: Input): Promise<never> {
-      void input;
-      const successor = continuationRunId(chainRoot(run), runGeneration(run) + 1);
-      throw new Error(`ctx.continueAsNew is not implemented yet (would be run ${successor})`);
+      // No call position and no history event. The successor's id is derived,
+      // so creating it is idempotent, and this run is terminal the moment the
+      // handover is recorded — there is nothing for a later replay to read
+      // back, and nothing above this call to keep a position for.
+      const runId = await deps.continueAsNew(input);
+
+      run.status = "continued";
+      run.continuation = { runId };
+      run.wakeAt = null;
+      run.waitingFor = null;
+      run.pendingTimer = null;
+      // The successor was created holding these. Leaving a copy here would
+      // show an operator payloads that another run is going to consume.
+      run.pendingSignals = {};
+      return suspend();
     },
   };
 

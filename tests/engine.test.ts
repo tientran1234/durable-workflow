@@ -1215,9 +1215,10 @@ describe("continuations", () => {
   });
 
   it("ends the run and carries the work on in a successor with an empty history", async () => {
-    const { engine, drain } = harness([batches]);
+    const { engine } = harness([batches]);
     await engine.start(batches, { left: 3, done: 0 }, { id: "r1" });
-    await drain();
+    const settled = await engine.settle("r1"); // on through the handovers
+    expect(settled.id).toBe("r1~3");
 
     const first = await engine.get("r1");
     expect(first?.status).toBe("continued");
