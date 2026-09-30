@@ -320,6 +320,70 @@ The timeline still lists every settled call; the 118 superseded attempts within
 the first 9,412 positions are gone. A run whose full audit trail matters more
 than its tick cost sets `compactAfter: Infinity` and keeps all of it.
 
+## Continuations
+
+Compaction stops replay paying for a history it has already settled, but the
+settled results themselves stay — replay needs them — so a run that never ends
+still grows. `ctx.continueAsNew` is where it ends: the run stops, and the work
+carries on in a fresh run of the same workflow with an empty history.
+
+```ts
+const sweep = defineWorkflow<{ cursor: string | null; swept: number }, number>("sweep", async (ctx, state) => {
+  const batch = await ctx.step("page", () => db.page(state.cursor));
+  await ctx.step("archive", () => archive(batch.rows));
+
+  const swept = state.swept + batch.rows.length;
+  if (batch.next === null) return swept;
+
+  await ctx.sleep("breathe", 60_000);
+  return ctx.continueAsNew({ cursor: batch.next, swept });   // never returns
+});
+```
+
+It unwinds the function the way `waitFor` does, so it is the last thing the
+call reaches — `return ctx.continueAsNew(…)` rather than a call whose result
+gets used. What the successor knows is what you hand it: its history is empty,
+so a memoised step is not memoised there, which is the point.
+
+The successor's id is `${root}~${generation}` — `run-1`, `run-1~2`, `run-1~3` —
+derived from the chain rather than from the run it follows. Derived, so
+starting it is exactly-once: a pass that dies between creating the successor
+and recording the handover replays into the same run instead of forking a
+second chain. From the chain rather than its predecessor, so a run that
+continues a thousand times does not carry a thousand suffixes.
+
+A handover is not a completion. The run ends as `continued` with a pointer to
+the successor, and `onRunCompleted` fires once per chain rather than once per
+generation, because a generation that continued has produced no output — and a
+parent waiting on it is owed the chain's outcome, so the link moves on with the
+work and the last generation is what reports.
+
+```ts
+const view = await engine.view("run-1");
+// status: "continued", chain: { root: "run-1", generation: 1 }, continuation: { runId: "run-1~2" }
+```
+
+**The successor starts on the newest registered version.** A run pinned to v1
+continues onto v2 if v2 is registered. Nothing else about versions changes —
+within a generation a run still replays on the version it started on — but a
+run that continues forever would otherwise never reach new code, and a handover
+is the one point in its life where no history has to survive the change. It is
+the place a deploy drains through.
+
+**A chain is one piece of work from the outside.** `engine.signal`, `cancel`
+and `settle` walk to the generation that is running, so an admin screen or a
+child holding an id from six generations ago still addresses the work rather
+than a run that is done. Signals the predecessor had buffered and never
+consumed move over too: whether a signal survives should not depend on which
+side of a handover it landed on. Reading stays per-run — `get`, `view` and
+`list` answer about the record you asked for, which is what makes each
+generation's history inspectable on its own.
+
+**When to stop is the workflow's business.** Nothing here caps a chain; the
+`if` that returns instead of continuing is the only thing that ends one. A
+workflow that continues unconditionally is an infinite loop that survives
+restarts.
+
 ## Design decisions
 
 **Retries are persisted wake times, not `setTimeout`.** A failed step records
@@ -402,14 +466,15 @@ src/
   children.ts     how a parent names its child and the signal the engine answers on
   hooks.ts        the lifecycle payloads, and the call that cannot fail a run
   schedule.ts     the period a clock reading falls in, and the id that period's run takes
+  continuation.ts a chain's root, a run's generation, and the id the next one takes
   stores/memory.ts
   stores/sqlite.ts     the same record on a file: one writer, so claiming is one statement
   stores/postgres.ts   JSONB record + mirrored query columns + SKIP LOCKED claim
 tests/
-  engine.test.ts        66 tests with a hand-driven clock: memoisation, durable
+  engine.test.ts        75 tests with a hand-driven clock: memoisation, durable
                         backoff, early signals, timeouts, nondeterminism, leases,
                         listing, the run view, child runs, compaction, the
-                        lifecycle hooks and scheduled starts
+                        lifecycle hooks, scheduled starts and continuations
   sqlite.test.ts        9 tests on a real file: a run resumed after the process
                         that started it is gone, stale writes, leases across two
                         connections, keyset paging
@@ -433,11 +498,16 @@ CI runs the full suite, Postgres included, on every push.
 - **Migrating an in-flight run between versions.** A run finishes on the
   version it started on; there is no hook to rewrite its history onto the next
   one. Keep the old definition registered until those runs drain.
-- **Ending a long run to start a fresh one.** Compaction stops replay paying
-  for history it has already settled, but the settled results themselves are
-  kept because replay needs them, so a run that never ends still grows. The fix
-  is to finish it and start a successor with the state it carries forward, by
-  hand.
+- **A view over a whole continuation chain.** `engine.list` and `engine.view`
+  answer about one run, and a chain is a run per generation, so an operator
+  following one walks it by id — `run-1`, `run-1~2` — rather than reading it as
+  a single timeline. Stitching them is a query over `chain.root`, which is the
+  store's job and not this library's.
+- **Continuing a run from outside it.** `ctx.continueAsNew` is a decision the
+  workflow makes about its own state, and only the workflow knows what the next
+  generation needs to be handed. There is no `engine.continueAsNew`; cancelling
+  a run and starting another is that, without the pretence that the two are one
+  piece of work.
 - **Durable hook delivery.** A lifecycle hook is an in-process call made after
   the write it reports; a worker that dies in between emits nothing, and nothing
   replays it. A side effect that must not be lost goes in the workflow as a step.

@@ -9,3 +9,4 @@ One item per pull request, in order.
 - [x] SQLite store (`better-sqlite3`, optional peer) for single-node deployments and tests without Postgres.
 - [x] Lifecycle hooks: `onRunCompleted`, `onRunFailed`, `onStepFailed` for metrics and alerting.
 - [x] Scheduled starts: `engine.schedule(workflow, input, { every })` with idempotent run ids per period.
+- [x] Continuations: `ctx.continueAsNew(input)` ends a long run and hands the work to a fresh one, with derived ids per generation.
