@@ -23,8 +23,15 @@ export interface RunFailedEvent extends RunEvent {
 }
 
 export interface StepFailedEvent extends RunEvent {
+  /**
+   * Which kind of durable unit this was: a ctx.step, or an undo the engine ran
+   * because the run failed. An undo that keeps failing is the louder of the two
+   * — the work it was there to reverse is still done.
+   */
+  kind: "step" | "compensation";
+  /** The unit's name: the step's, or the compensation's when `kind` says so. */
   step: string;
-  /** 1 on the step's first failure in this run. */
+  /** 1 on the unit's first failure in this run. */
   attempt: number;
   error: string;
   /**
@@ -42,7 +49,7 @@ export interface StepFailedEvent extends RunEvent {
 export interface LifecycleHooks {
   onRunCompleted?(event: RunCompletedEvent): void | Promise<void>;
   onRunFailed?(event: RunFailedEvent): void | Promise<void>;
-  /** Once per failed attempt, including the ones that will be retried. */
+  /** Once per failed step or compensation attempt, including the ones that will be retried. */
   onStepFailed?(event: StepFailedEvent): void | Promise<void>;
 }
 

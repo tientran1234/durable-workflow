@@ -119,6 +119,12 @@ function summarise(event: HistoryEvent): string {
       return event.retryAt === undefined
         ? `step "${event.name}" failed on attempt ${event.attempt}, no attempts left: ${event.error}`
         : `step "${event.name}" failed on attempt ${event.attempt}, retrying: ${event.error}`;
+    case "compensation.completed":
+      return `compensation "${event.name}" completed`;
+    case "compensation.failed":
+      return event.retryAt === undefined
+        ? `compensation "${event.name}" failed on attempt ${event.attempt}, no attempts left: ${event.error}`
+        : `compensation "${event.name}" failed on attempt ${event.attempt}, retrying: ${event.error}`;
     case "signal.received":
       return `signal "${event.name}" received`;
     case "signal.timeout":

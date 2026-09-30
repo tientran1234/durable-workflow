@@ -5,6 +5,7 @@ export { defineWorkflow } from "./types.js";
 export type {
   ChildHandle,
   ChildOutcome,
+  Compensation,
   HistoryEvent,
   HistorySnapshot,
   RetryPolicy,
@@ -54,6 +55,7 @@ export { isDue, TERMINAL } from "./due.js";
 export { DEFAULT_LIMIT, MAX_LIMIT, afterCursor, byNewest, decodeCursor, encodeCursor, pageLimit } from "./list.js";
 export {
   ChildFailedError,
+  CompensationFailedError,
   ConflictError,
   NondeterminismError,
   RunNotFoundError,

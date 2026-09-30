@@ -7,10 +7,16 @@ export type RunStatus = "running" | "sleeping" | "waiting" | "completed" | "fail
  * execution appends to it. `call` is the position of the ctx.* call that
  * produced the event, which is what lets a re-executed workflow function find
  * its own past.
+ *
+ * A compensation records the same pair a step does, under positions above the
+ * call the run failed at: it is a durable unit like any other, and keeping it a
+ * type of its own is what stops an undo reading as the work it undid.
  */
 export type HistoryEvent =
   | { seq: number; call: number; type: "step.completed"; name: string; result: unknown; at: number }
   | { seq: number; call: number; type: "step.failed"; name: string; attempt: number; error: string; retryAt?: number; at: number }
+  | { seq: number; call: number; type: "compensation.completed"; name: string; at: number }
+  | { seq: number; call: number; type: "compensation.failed"; name: string; attempt: number; error: string; retryAt?: number; at: number }
   | { seq: number; call: number; type: "signal.received"; name: string; payload: unknown; at: number }
   | { seq: number; call: number; type: "signal.timeout"; name: string; at: number }
   | { seq: number; call: number; type: "timer.fired"; name: string; at: number }
@@ -99,6 +105,17 @@ export interface StepOptions {
 }
 
 /**
+ * An undo registered by ctx.compensate, as the engine holds it. `fn` is a plain
+ * function rather than a workflow: it runs inside a durable unit of its own, so
+ * it must not call ctx.* itself.
+ */
+export interface Compensation {
+  name: string;
+  fn: () => Promise<unknown> | unknown;
+  options?: StepOptions;
+}
+
+/**
  * A child run as its parent addresses it. Everything in it is derived from the
  * parent's run id and the position of the startChild call, so the same handle
  * comes back on every replay.
@@ -125,6 +142,17 @@ export interface WorkflowContext<Input> {
    * stored result without calling `fn`. Results must be JSON-serialisable.
    */
   step<T>(name: string, fn: () => Promise<T> | T, options?: StepOptions): Promise<T>;
+  /**
+   * Register an undo for what was just done — the step above this call. If the
+   * run goes on to fail, every undo registered by then runs, newest first, each
+   * as a durable step of its own with its own retries.
+   *
+   * Registering is not durable and records nothing: replay re-registers by
+   * re-executing, so the undos that exist are exactly the ones this pass
+   * reached. It therefore does not suspend, which is why it returns nothing to
+   * await.
+   */
+  compensate(name: string, fn: () => Promise<unknown> | unknown, options?: StepOptions): void;
   /** Suspend until `engine.signal(runId, name, payload)` — or until `timeoutMs`, which throws WaitTimeoutError. */
   waitFor<T = unknown>(name: string, options?: { timeoutMs?: number }): Promise<T>;
   /** A durable timer: survives restarts, costs nothing while pending. */

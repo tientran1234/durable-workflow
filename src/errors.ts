@@ -23,6 +23,24 @@ export class StepFailedError extends Error {
   }
 }
 
+/**
+ * A registered undo exhausted its retries, so the work it was there to undo is
+ * still done. It never reaches workflow code — the function has already unwound
+ * by the time compensations run — so the engine is what catches it, records the
+ * undo as not done, and carries on with the rest of them.
+ */
+export class CompensationFailedError extends Error {
+  override readonly name = "CompensationFailedError";
+  constructor(
+    readonly compensation: string,
+    readonly attempts: number,
+    readonly lastError: string,
+    options?: { cause?: unknown },
+  ) {
+    super(`compensation "${compensation}" failed after ${attempts} attempt(s): ${lastError}`, options);
+  }
+}
+
 export class WaitTimeoutError extends Error {
   override readonly name = "WaitTimeoutError";
   constructor(readonly signal: string) {

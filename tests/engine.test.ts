@@ -1363,3 +1363,274 @@ describe("continuations", () => {
     expect(second?.continuation).toBeNull();
   });
 });
+
+describe("saga compensation", () => {
+  /** The shape the feature exists for: each step registers its undo right after it succeeds. */
+  function order(options: {
+    release?: () => void;
+    refund?: () => void;
+    refundRetry?: number;
+    ship?: () => string;
+  }) {
+    return defineWorkflow<null, string>("order", async (ctx) => {
+      await ctx.step("reserve", () => "res_1");
+      ctx.compensate("release", () => options.release?.());
+      await ctx.step("charge", () => "ch_1");
+      ctx.compensate("refund", () => options.refund?.(), { retry: { maxAttempts: options.refundRetry ?? 3 } });
+      return ctx.step("ship", () => options.ship?.() ?? "shipped", { retry: { maxAttempts: 1 } });
+    });
+  }
+
+  it("runs the registered undos newest first when a step fails for good", async () => {
+    const undone: string[] = [];
+    const wf = order({
+      release: () => void undone.push("release"),
+      refund: () => void undone.push("refund"),
+      ship: () => {
+        throw new Error("no courier");
+      },
+    });
+    const { engine } = harness([wf]);
+    const id = await engine.start(wf, null);
+    const run = await engine.settle(id);
+
+    expect(run.status).toBe("failed");
+    expect(undone).toEqual(["refund", "release"]);
+    expect(run.error).toMatch(/"ship" failed after 1 attempt\(s\): no courier/);
+    // The undos sit above the call the run failed at, in the order they ran.
+    expect(historyEvents(run).map((e) => [e.call, e.type, e.name])).toEqual([
+      [0, "step.completed", "reserve"],
+      [1, "step.completed", "charge"],
+      [2, "step.failed", "ship"],
+      [3, "compensation.completed", "refund"],
+      [4, "compensation.completed", "release"],
+    ]);
+  });
+
+  it("leaves the undos alone when the workflow handles the failure itself", async () => {
+    const undone: string[] = [];
+    const wf = defineWorkflow<null, string>("handled", async (ctx) => {
+      await ctx.step("charge", () => "ch_1");
+      ctx.compensate("refund", () => void undone.push("refund"));
+      try {
+        return await ctx.step(
+          "ship",
+          () => {
+            throw new Error("no courier");
+          },
+          { retry: { maxAttempts: 1 } },
+        );
+      } catch (err) {
+        if (!(err instanceof StepFailedError)) throw err;
+        return "apologised";
+      }
+    });
+    const { engine } = harness([wf]);
+    const id = await engine.start(wf, null);
+    const run = await engine.settle(id);
+
+    expect(run.status).toBe("completed");
+    expect(run.output).toBe("apologised");
+    expect(undone).toEqual([]);
+  });
+
+  it("leaves the undos alone when the run completes", async () => {
+    const undone: string[] = [];
+    const wf = order({ release: () => void undone.push("release"), refund: () => void undone.push("refund") });
+    const { engine } = harness([wf]);
+    const id = await engine.start(wf, null);
+    const run = await engine.settle(id);
+
+    expect(run.status).toBe("completed");
+    expect(run.output).toBe("shipped");
+    expect(undone).toEqual([]);
+  });
+
+  it("runs each undo at most once, however many passes the failure replays through", async () => {
+    const undone: string[] = [];
+    let releaseAttempts = 0;
+    const wf = order({
+      release: () => {
+        if (++releaseAttempts === 1) throw new Error("inventory down");
+        undone.push("release");
+      },
+      refund: () => void undone.push("refund"),
+      ship: () => {
+        throw new Error("no courier");
+      },
+    });
+    const { engine, advance } = harness([wf]);
+    const id = await engine.start(wf, null);
+
+    let run = await engine.settle(id);
+    expect(run.status).toBe("sleeping"); // "release" is serving out its backoff
+    expect(undone).toEqual(["refund"]);
+
+    advance(1_000);
+    run = await engine.settle(id);
+
+    expect(run.status).toBe("failed");
+    // "refund" is memoised by the replay that carried the phase on.
+    expect(undone).toEqual(["refund", "release"]);
+    expect(releaseAttempts).toBe(2);
+  });
+
+  it("retries an undo on a persisted wake time, under its own policy", async () => {
+    let attempts = 0;
+    const wf = order({
+      refundRetry: 4,
+      refund: () => {
+        if (++attempts < 3) throw new Error(`gateway ${attempts}`);
+      },
+      ship: () => {
+        throw new Error("no courier");
+      },
+    });
+    const { engine, advance } = harness([wf]);
+    const id = await engine.start(wf, null);
+
+    let run = await engine.settle(id);
+    expect(run.status).toBe("sleeping");
+    expect(run.wakeAt).toBe(T0 + 1_000);
+    expect(attempts).toBe(1);
+
+    run = await engine.tick(id); // too early — the backoff is a wake time, not a timer
+    expect(attempts).toBe(1);
+
+    advance(1_000);
+    run = await engine.settle(id);
+    expect(run.wakeAt).toBe(T0 + 1_000 + 2_000); // factor 2, same as a step
+    expect(attempts).toBe(2);
+
+    advance(2_000);
+    run = await engine.settle(id);
+
+    expect(run.status).toBe("failed");
+    expect(attempts).toBe(3);
+    expect(historyEvents(run).filter((e) => e.type === "compensation.failed")).toHaveLength(2);
+  });
+
+  it("carries on below an undo that exhausted its retries, and names it on the run", async () => {
+    const undone: string[] = [];
+    const wf = order({
+      release: () => void undone.push("release"),
+      refundRetry: 1,
+      refund: () => {
+        throw new Error("gateway down");
+      },
+      ship: () => {
+        throw new Error("no courier");
+      },
+    });
+    const { engine } = harness([wf]);
+    const id = await engine.start(wf, null);
+    const run = await engine.settle(id);
+
+    expect(run.status).toBe("failed");
+    // Abandoning "release" would leave more of the saga applied, not less.
+    expect(undone).toEqual(["release"]);
+    expect(run.error).toMatch(/"ship" failed after 1 attempt\(s\): no courier/);
+    expect(run.error).toMatch(/compensation did not complete: "refund" \(gateway down\)/);
+  });
+
+  it("undoes nothing when replay no longer matches the code", async () => {
+    const undone: string[] = [];
+    const body = (timer: string) =>
+      defineWorkflow<null, string>("drifting", async (ctx) => {
+        await ctx.step("charge", () => "ch_1");
+        ctx.compensate("refund", () => void undone.push("refund"));
+        await ctx.sleep(timer, 1_000);
+        return ctx.step("ship", () => "shipped");
+      });
+    const { engine, advance, deploy } = harness([body("hold")]);
+    const id = await engine.start(body("hold"), null);
+    await engine.settle(id);
+
+    advance(1_000);
+    const run = await deploy([body("wait")]).settle(id);
+
+    expect(run.status).toBe("failed");
+    expect(run.error).toMatch(/"hold" in history but "wait" now/);
+    // The history and the code disagree, so which undos the run owes is guesswork.
+    expect(undone).toEqual([]);
+  });
+
+  it("shows an undo on the timeline and reports one serving out its backoff", async () => {
+    let attempts = 0;
+    const wf = order({
+      release: () => {},
+      refund: () => {
+        if (++attempts === 1) throw new Error("gateway down");
+      },
+      ship: () => {
+        throw new Error("no courier");
+      },
+    });
+    const { engine, advance } = harness([wf]);
+    const id = await engine.start(wf, null);
+    await engine.settle(id);
+
+    const sleeping = await engine.view(id);
+    expect(sleeping?.blockedOn).toEqual({ kind: "retry", name: "refund", until: T0 + 1_000 });
+
+    advance(1_000);
+    await engine.settle(id);
+    const failed = await engine.view(id);
+
+    expect(failed?.blockedOn).toBeNull();
+    expect(failed?.timeline.map((e) => e.summary).slice(2)).toEqual([
+      'step "ship" failed on attempt 1, no attempts left: no courier',
+      'compensation "refund" failed on attempt 1, retrying: gateway down',
+      'compensation "refund" completed',
+      'compensation "release" completed',
+    ]);
+  });
+
+  it("reports a failing undo as a compensation rather than as a step", async () => {
+    const failures: StepFailedEvent[] = [];
+    const wf = order({
+      refundRetry: 1,
+      refund: () => {
+        throw new Error("gateway down");
+      },
+      ship: () => {
+        throw new Error("no courier");
+      },
+    });
+    const { engine } = harness([wf], { hooks: { onStepFailed: (e) => void failures.push(e) } });
+    const id = await engine.start(wf, null);
+    await engine.settle(id);
+
+    expect(failures.map((e) => [e.kind, e.step, e.attempt, e.retryAt])).toEqual([
+      ["step", "ship", 1, null],
+      ["compensation", "refund", 1, null],
+    ]);
+  });
+
+  it("keeps folding history past a registration, because registering records nothing", async () => {
+    const wf = defineWorkflow<{ steps: number }, number>("undoable", async (ctx, input) => {
+      let total = 0;
+      for (let i = 0; i < input.steps; i++) {
+        total += await ctx.step(`work-${i}`, () => 1);
+        ctx.compensate(`undo-${i}`, () => {});
+        await ctx.sleep(`pause-${i}`, 1_000);
+      }
+      return total;
+    });
+    const { engine, advance } = harness([wf], { compactAfter: 4 });
+    const id = await engine.start(wf, { steps: 10 });
+
+    let run = await engine.settle(id);
+    for (let i = 0; i < 12 && run.status !== "completed"; i++) {
+      advance(1_000);
+      run = await engine.settle(id);
+    }
+
+    expect(run.status).toBe("completed");
+    expect(run.output).toBe(10);
+    // 20 calls, all but the last tick's two folded. A registration that took a
+    // call position of its own would leave a hole in the prefix, and the
+    // snapshot would have stopped at the first one.
+    expect(run.snapshot?.calls).toBe(18);
+  });
+});

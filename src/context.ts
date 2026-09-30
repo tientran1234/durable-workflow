@@ -6,6 +6,7 @@ import { DEFAULT_RETRY, backoffMs } from "./retry.js";
 import type {
   ChildHandle,
   ChildOutcome,
+  Compensation,
   HistoryEvent,
   NewEvent,
   RetryPolicy,
@@ -44,6 +45,11 @@ export interface ContextDeps {
 export interface ReplayContext<Input> extends WorkflowContext<Input> {
   /** True once this pass hit a waitFor/sleep/retry and unwound. */
   readonly suspended: boolean;
+  /**
+   * The undos ctx.compensate reached on this pass, in registration order. The
+   * engine runs them when the pass ends in a failure; see src/saga.ts.
+   */
+  readonly compensations: readonly Compensation[];
 }
 
 /**
@@ -55,6 +61,7 @@ export interface ReplayContext<Input> extends WorkflowContext<Input> {
 export function createContext<Input>(run: RunRecord, deps: ContextDeps): ReplayContext<Input> {
   let call = 0;
   let suspended = false;
+  const compensations: Compensation[] = [];
 
   const at = (c: number, types: HistoryEvent["type"][]) => {
     // A settled call is one event in the snapshot, found by position. That is
@@ -88,6 +95,9 @@ export function createContext<Input>(run: RunRecord, deps: ContextDeps): ReplayC
     input: run.input as Input,
     get suspended() {
       return suspended;
+    },
+    get compensations() {
+      return compensations;
     },
 
     async step<T>(name: string, fn: () => Promise<T> | T, options?: StepOptions): Promise<T> {
@@ -130,6 +140,7 @@ export function createContext<Input>(run: RunRecord, deps: ContextDeps): ReplayC
         const report = () =>
           notify(deps.hooks.onStepFailed, {
             ...runEvent(run, deps.now()),
+            kind: "step",
             step: name,
             attempt,
             error,
@@ -147,6 +158,14 @@ export function createContext<Input>(run: RunRecord, deps: ContextDeps): ReplayC
         run.wakeAt = retryAt;
         return suspend(report);
       }
+    },
+
+    compensate(name: string, fn: () => Promise<unknown> | unknown, options?: StepOptions): void {
+      // No call position and no event. Registering decides nothing, so there is
+      // nothing for a later replay to read back — and a position that never got
+      // an event of its own would stop compaction folding past it for the rest
+      // of the run.
+      compensations.push({ name, fn, ...(options ? { options } : {}) });
     },
 
     async waitFor<T>(name: string, options?: { timeoutMs?: number }): Promise<T> {
