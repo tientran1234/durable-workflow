@@ -8,6 +8,7 @@ export type {
   Compensation,
   HistoryEvent,
   HistorySnapshot,
+  RejectedSignal,
   RetryPolicy,
   RunPage,
   RunQuery,
@@ -42,6 +43,10 @@ export { chainRoot, continuationRunId, runGeneration } from "./continuation.js";
 export { schedulePeriod, scheduleRunId } from "./schedule.js";
 export type { ScheduleOptions, ScheduledRun } from "./schedule.js";
 
+// Typed signals: a name and the schema the engine checks payloads against.
+export { MAX_REJECTED_SIGNALS, defineSignal, signalName } from "./signals.js";
+export type { SignalDefinition, SignalSchema } from "./signals.js";
+
 export { renderRun } from "./view.js";
 export type { RunBlockedOn, RunView, TimelineEntry } from "./view.js";
 
@@ -59,6 +64,7 @@ export {
   ConflictError,
   NondeterminismError,
   RunNotFoundError,
+  SignalRejectedError,
   StepFailedError,
   WaitTimeoutError,
   WorkflowNotFoundError,

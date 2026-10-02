@@ -41,6 +41,23 @@ export class CompensationFailedError extends Error {
   }
 }
 
+/**
+ * A signal's payload did not satisfy the signal's schema, so the engine refused
+ * it. Thrown to whoever sent it — an admin endpoint, a webhook handler — rather
+ * than into the workflow: the run never saw the payload, and the caller is the
+ * only party that can do anything about its shape.
+ */
+export class SignalRejectedError extends Error {
+  override readonly name = "SignalRejectedError";
+  constructor(
+    readonly signal: string,
+    readonly reason: string,
+    options?: { cause?: unknown },
+  ) {
+    super(`signal "${signal}" was rejected: ${reason}`, options);
+  }
+}
+
 export class WaitTimeoutError extends Error {
   override readonly name = "WaitTimeoutError";
   constructor(readonly signal: string) {

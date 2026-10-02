@@ -15,6 +15,7 @@ import { type LifecycleHooks, notify, runEvent } from "./hooks.js";
 import { DEFAULT_RETRY } from "./retry.js";
 import { compensatedError, runCompensations } from "./saga.js";
 import { type ScheduleOptions, type ScheduledRun, schedulePeriod, scheduleRunId } from "./schedule.js";
+import { type SignalDefinition, SignalRegistry, signalName } from "./signals.js";
 import type { ChildHandle, RetryPolicy, RunPage, RunQuery, RunRecord, RunStore, WorkflowDefinition } from "./types.js";
 import { type RunView, renderRun } from "./view.js";
 import { WorkflowRegistry, runVersion } from "./versions.js";
@@ -34,6 +35,12 @@ export interface EngineOptions {
    */
   compactAfter?: number;
   defaultRetry?: Partial<RetryPolicy>;
+  /**
+   * The signals this engine checks payloads against when it is handed a name
+   * rather than a definition — what an admin endpoint taking `{ name, payload }`
+   * off the wire needs. A name that is not here is unvalidated.
+   */
+  signals?: SignalDefinition<unknown>[];
   /** Observers for metrics and alerting. See LifecycleHooks. */
   hooks?: LifecycleHooks;
   idFactory?: () => string;
@@ -46,6 +53,7 @@ export interface WorkerHandle {
 export class Engine {
   private readonly store: RunStore;
   private readonly workflows = new WorkflowRegistry();
+  private readonly signals = new SignalRegistry();
   private readonly now: () => number;
   private readonly leaseMs: number;
   private readonly compactAfter: number;
@@ -56,6 +64,7 @@ export class Engine {
   constructor(options: EngineOptions) {
     this.store = options.store;
     for (const wf of options.workflows) this.workflows.add(wf);
+    for (const signal of options.signals ?? []) this.signals.add(signal);
     this.now = options.now ?? (() => Date.now());
     this.leaseMs = options.leaseMs ?? 30_000;
     this.compactAfter = options.compactAfter ?? DEFAULT_COMPACT_AFTER;
@@ -184,10 +193,17 @@ export class Engine {
    * Deliver a signal. If the run is waiting for it, the run resumes now. If
    * not, the payload is buffered and consumed by the matching waitFor later —
    * a signal that arrives early is not lost.
+   *
+   * `payload` is `unknown` whichever way the signal is named: a signal arrives
+   * from outside the process, so what a schema buys is the check here and the
+   * type ctx.waitFor returns, not a compiler that was never in the way.
    */
-  async signal(id: string, name: string, payload: unknown = null): Promise<RunRecord> {
+  signal<T>(id: string, signal: SignalDefinition<T>, payload: unknown): Promise<RunRecord>;
+  signal(id: string, name: string, payload?: unknown): Promise<RunRecord>;
+  async signal(id: string, target: SignalDefinition<unknown> | string, payload: unknown = null): Promise<RunRecord> {
     const run = await this.live(id);
     if (TERMINAL.has(run.status)) throw new Error(`run ${run.id} is ${run.status}; cannot signal`);
+    const name = signalName(target);
 
     if (run.waitingFor?.name === name) {
       appendEvent(run, { call: run.waitingFor.call, type: "signal.received", name, payload }, this.now());

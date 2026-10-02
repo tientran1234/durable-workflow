@@ -3,14 +3,17 @@ import {
   ChildFailedError,
   type ChildHandle,
   ConflictError,
+  MAX_REJECTED_SIGNALS,
   NondeterminismError,
   type RunCompletedEvent,
   type RunFailedEvent,
   type RunPage,
   type RunRecord,
+  SignalRejectedError,
   StepFailedError,
   type StepFailedEvent,
   WaitTimeoutError,
+  defineSignal,
   defineWorkflow,
   historyEvents,
   schedulePeriod,
@@ -1632,5 +1635,151 @@ describe("saga compensation", () => {
     // call position of its own would leave a hole in the prefix, and the
     // snapshot would have stopped at the first one.
     expect(run.snapshot?.calls).toBe(18);
+  });
+});
+
+describe("typed signals", () => {
+  /**
+   * A schema is anything with zod's `parse`, so the suite hand-rolls one rather
+   * than take the dependency. The default on `note` is the schema's, which is
+   * how a test can tell the parsed value apart from the payload as it arrived.
+   */
+  const approval = defineSignal("approve", {
+    parse(payload: unknown): { ok: boolean; note: string } {
+      if (typeof payload !== "object" || payload === null) throw new Error("expected an object");
+      const { ok, note } = payload as { ok?: unknown; note?: unknown };
+      if (typeof ok !== "boolean") throw new Error("expected `ok` to be a boolean");
+      if (note !== undefined && typeof note !== "string") throw new Error("expected `note` to be a string");
+      return { ok, note: typeof note === "string" ? note : "" };
+    },
+  });
+
+  const review = defineWorkflow<null, string>("review", async (ctx) => {
+    const { ok, note } = await ctx.waitFor(approval, { timeoutMs: 60_000 });
+    return `${ok ? "approved" : "declined"}:${note}`;
+  });
+
+  it("hands the workflow what the schema returned, not the payload as it arrived", async () => {
+    const { engine } = harness([review]);
+    const id = await engine.start(review, null);
+    await engine.settle(id);
+
+    const run = await engine.signal(id, approval, { ok: true });
+
+    expect(run.status).toBe("completed");
+    // The payload carried no note; the schema's default is what the run saw.
+    expect(run.output).toBe("approved:");
+  });
+
+  it("refuses a payload the schema rejects before it reaches history", async () => {
+    const { engine } = harness([review]);
+    const id = await engine.start(review, null);
+    await engine.settle(id);
+
+    await expect(engine.signal(id, approval, { ok: "yes" })).rejects.toThrow(SignalRejectedError);
+
+    const run = await engine.get(id);
+    expect(run?.status).toBe("waiting");
+    expect(run?.waitingFor).toEqual({ name: "approve", call: 0 });
+    expect(historyEvents(run as RunRecord)).toEqual([]);
+    expect(run?.pendingSignals).toEqual({});
+  });
+
+  it("refuses a payload that would otherwise have been buffered ahead of its waitFor", async () => {
+    const wf = defineWorkflow<null, string>("late-review", async (ctx) => {
+      await ctx.sleep("prep", 5_000);
+      const { note } = await ctx.waitFor(approval);
+      return note;
+    });
+    const { engine, advance } = harness([wf]);
+    const id = await engine.start(wf, null);
+    await engine.settle(id); // sleeping, nowhere near the waitFor
+
+    await expect(engine.signal(id, approval, "nope")).rejects.toThrow(/expected an object/);
+    expect((await engine.get(id))?.pendingSignals).toEqual({});
+
+    await engine.signal(id, approval, { ok: true, note: "fine" });
+    advance(5_000);
+    expect((await engine.settle(id)).output).toBe("fine");
+  });
+
+  it("records the refusal on the run, where an operator looking at it can see why", async () => {
+    const { engine, advance } = harness([review]);
+    const id = await engine.start(review, null);
+    await engine.settle(id);
+    advance(1_000);
+
+    await expect(engine.signal(id, approval, {})).rejects.toThrow(SignalRejectedError);
+
+    const view = await engine.view(id);
+    expect(view?.rejectedSignals).toEqual([
+      { name: "approve", error: "expected `ok` to be a boolean", at: T0 + 1_000 },
+    ]);
+    // Nothing was delivered, so the timeline has nothing to say about it.
+    expect(view?.timeline).toEqual([]);
+    expect(view?.blockedOn).toEqual({ kind: "signal", name: "approve", until: T0 + 60_000 });
+  });
+
+  it("keeps the most recent refusals and no more", async () => {
+    const { engine } = harness([review]);
+    const id = await engine.start(review, null);
+    await engine.settle(id);
+
+    for (let i = 0; i < MAX_REJECTED_SIGNALS + 3; i++) {
+      await expect(engine.signal(id, approval, { ok: true, note: i })).rejects.toThrow(SignalRejectedError);
+    }
+
+    // A caller looping on a bad payload must not grow the record without bound.
+    const { rejectedSignals } = (await engine.view(id)) ?? {};
+    expect(rejectedSignals).toHaveLength(MAX_REJECTED_SIGNALS);
+    expect(rejectedSignals?.[0]?.error).toBe("expected `note` to be a string");
+  });
+
+  it("checks a signal named by string once its schema is registered with the engine", async () => {
+    const { engine } = harness([review], { signals: [approval] });
+    const id = await engine.start(review, null);
+    await engine.settle(id);
+
+    // An admin endpoint has a name off the wire, not the definition.
+    await expect(engine.signal(id, "approve", { ok: 1 })).rejects.toThrow(SignalRejectedError);
+    expect((await engine.signal(id, "approve", { ok: false, note: "thin" })).output).toBe("declined:thin");
+  });
+
+  it("checks a definition it was handed even when the engine was not given it", async () => {
+    const { engine } = harness([review]);
+    const id = await engine.start(review, null);
+    await engine.settle(id);
+
+    await expect(engine.signal(id, approval, null)).rejects.toThrow(SignalRejectedError);
+  });
+
+  it("leaves a signal with no schema alone", async () => {
+    const wf = defineWorkflow<null, unknown>("untyped", async (ctx) => ctx.waitFor("whatever"));
+    const { engine } = harness([wf], { signals: [approval] });
+    const id = await engine.start(wf, null);
+    await engine.settle(id);
+
+    expect((await engine.signal(id, "whatever", 17)).output).toBe(17);
+  });
+
+  it("does not refuse the outcome a child reports to its parent", async () => {
+    const child = defineWorkflow<{ n: number }, number>("halve", async (ctx, input) =>
+      ctx.step("divide", () => input.n / 2),
+    );
+    const parent = defineWorkflow<{ n: number }, number>("halver", async (ctx, input) =>
+      ctx.waitForChild(await ctx.startChild(child, { n: input.n })),
+    );
+    // The signal a child reports on is derived, so it has no schema to register
+    // — and must not be held to anyone else's.
+    const { engine, drain } = harness([parent, child], { signals: [approval] });
+    const id = await engine.start(parent, { n: 84 });
+    await drain();
+
+    expect((await engine.get(id))?.output).toBe(42);
+  });
+
+  it("refuses two schemas for one signal name", async () => {
+    const other = defineSignal("approve", { parse: (payload: unknown) => payload });
+    expect(() => harness([review], { signals: [approval, other] })).toThrow(/registered twice/);
   });
 });

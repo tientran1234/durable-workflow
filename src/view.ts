@@ -1,7 +1,7 @@
 import { historyEvents } from "./compaction.js";
 import { chainRoot, runGeneration } from "./continuation.js";
 import { TERMINAL } from "./due.js";
-import type { HistoryEvent, RunRecord, RunStatus } from "./types.js";
+import type { HistoryEvent, RejectedSignal, RunRecord, RunStatus } from "./types.js";
 import { runVersion } from "./versions.js";
 
 /** One history event as a line on a timeline. */
@@ -53,6 +53,13 @@ export interface RunView {
   /** Signals buffered ahead of their waitFor, by name, with how many payloads each. */
   pendingSignals: Record<string, number>;
   /**
+   * Payloads a schema refused, newest first. A refused signal never reached
+   * history, so the timeline below says nothing about it — which is the point:
+   * a run that looks like it is still waiting for a signal somebody insists
+   * they sent is explained here and nowhere else.
+   */
+  rejectedSignals: RejectedSignal[];
+  /**
    * Set once the run's history has been compacted, which is also the caveat on
    * the timeline below: `droppedEvents` retry attempts within the first `calls`
    * positions are no longer on record.
@@ -79,6 +86,7 @@ export function renderRun(run: RunRecord): RunView {
     pendingSignals: Object.fromEntries(
       Object.entries(run.pendingSignals).map(([name, payloads]) => [name, payloads.length]),
     ),
+    rejectedSignals: run.rejectedSignals ?? [],
     compaction: run.snapshot
       ? { calls: run.snapshot.calls, droppedEvents: run.snapshot.droppedEvents, at: run.snapshot.at }
       : null,

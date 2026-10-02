@@ -11,6 +11,7 @@ import {
 } from "./errors.js";
 import { type LifecycleHooks, notify, runEvent } from "./hooks.js";
 import { DEFAULT_RETRY, backoffMs } from "./retry.js";
+import { type SignalDefinition, signalName } from "./signals.js";
 import type {
   ChildHandle,
   ChildOutcome,
@@ -251,8 +252,12 @@ export function createContext<Input>(run: RunRecord, deps: ContextDeps): ReplayC
       await runDurable("compensation", call++, compensation.name, compensation.fn, compensation.options);
     },
 
-    async waitFor<T>(name: string, options?: { timeoutMs?: number }): Promise<T> {
+    async waitFor<T>(target: SignalDefinition<T> | string, options?: { timeoutMs?: number }): Promise<T> {
       const c = call++;
+      // A definition carries the schema the engine already applied on the way
+      // in, so nothing is parsed here: what history holds is what that schema
+      // returned, and re-checking it would only be able to disagree.
+      const name = signalName(target);
 
       const received = at(c, ["signal.received"])[0];
       if (received && received.type === "signal.received") {

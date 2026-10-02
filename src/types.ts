@@ -1,3 +1,4 @@
+import type { SignalDefinition } from "./signals.js";
 import { DEFAULT_VERSION } from "./versions.js";
 
 export type RunStatus = "running" | "sleeping" | "waiting" | "completed" | "failed" | "canceled" | "continued";
@@ -46,6 +47,22 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
 /** A history event before the engine assigns `seq` and `at`. */
 export type NewEvent = DistributiveOmit<HistoryEvent, "seq" | "at">;
 
+/**
+ * A signal the engine refused because its payload failed the signal's schema.
+ * Nothing was delivered and nothing was buffered, so this is the only record
+ * that it was ever sent.
+ *
+ * The payload is deliberately not kept. It is by definition not a shape
+ * anything here understands, and it came from outside the process, so what is
+ * worth recording is which signal was refused and why.
+ */
+export interface RejectedSignal {
+  name: string;
+  /** What the schema said when it refused the payload. */
+  error: string;
+  at: number;
+}
+
 export interface RunRecord {
   id: string;
   workflow: string;
@@ -80,6 +97,11 @@ export interface RunRecord {
   snapshot?: HistorySnapshot;
   /** Signals that arrived before the workflow reached the matching waitFor. */
   pendingSignals: Record<string, unknown[]>;
+  /**
+   * Payloads the engine refused, newest first and capped at
+   * MAX_REJECTED_SIGNALS. Absent until a run is sent one, which is most runs.
+   */
+  rejectedSignals?: RejectedSignal[];
   /** sleeping: when to wake. waiting: the deadline, or null for no timeout. */
   wakeAt: number | null;
   waitingFor: { name: string; call: number } | null;
@@ -153,7 +175,15 @@ export interface WorkflowContext<Input> {
    * await.
    */
   compensate(name: string, fn: () => Promise<unknown> | unknown, options?: StepOptions): void;
-  /** Suspend until `engine.signal(runId, name, payload)` — or until `timeoutMs`, which throws WaitTimeoutError. */
+  /**
+   * Suspend until `engine.signal(runId, signal, payload)` — or until
+   * `timeoutMs`, which throws WaitTimeoutError.
+   *
+   * Waiting on a definition is what makes the payload typed rather than cast:
+   * the engine checked it against that same schema on the way in, so the
+   * schema's output type is what arrives here.
+   */
+  waitFor<T>(signal: SignalDefinition<T>, options?: { timeoutMs?: number }): Promise<T>;
   waitFor<T = unknown>(name: string, options?: { timeoutMs?: number }): Promise<T>;
   /** A durable timer: survives restarts, costs nothing while pending. */
   sleep(name: string, ms: number): Promise<void>;
