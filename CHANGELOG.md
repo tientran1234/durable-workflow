@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-02
+
+- Typed signals: `defineSignal("approve", zodSchema)` so `waitFor` returns the parsed type and `engine.signal` rejects invalid payloads before they touch history, and the rejection is recorded on the run — so a payload from an admin endpoint or a webhook is checked where it enters the run rather than surfacing as a failure somewhere below the wait, and a run still waiting for a signal somebody insists they sent says why on `engine.view`.
+
 ## 2026-09-30
 
 - Saga compensation: `ctx.compensate(name, fn)` registers an undo for the step just completed, and when a later step fails for good the registrations run in reverse order, each as a durable step with its own retries — so unwinding a half-applied saga no longer means a catch block that has to know which steps got as far as happening, and a worker that dies mid-undo replays into the phase instead of undoing twice.

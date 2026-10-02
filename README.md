@@ -51,6 +51,77 @@ in microseconds and resumes exactly where it was.
 waiting for, persist, and unwind the function by throwing a control-flow
 sentinel. The run costs nothing until a signal arrives or the timer is due.
 
+## Typed signals
+
+A signal is the one input to a run that comes from outside TypeScript — an
+admin endpoint, a webhook, somebody's `curl`. `ctx.waitFor<{ approved: boolean }>`
+is a cast on trust: nothing checks that the payload is that, so
+`{ approved: "yes" }` is recorded, handed to the workflow, and surfaces as a
+failure somewhere below the wait with the history already carrying the cause.
+
+`defineSignal` puts the name and the schema in one value, which both sides read:
+
+```ts
+import { z } from "zod";
+import { defineSignal } from "durable-workflow";
+
+const approval = defineSignal("manual-review", z.object({ approved: z.boolean(), note: z.string().default("") }));
+
+const fulfilment = defineWorkflow<{ orderId: string }, string>("fulfilment", async (ctx, { orderId }) => {
+  const review = await ctx.waitFor(approval, { timeoutMs: 24 * 3600_000 });   // { approved: boolean; note: string }
+  return review.approved ? "shipped" : "refunded";
+});
+
+await engine.signal(runId, approval, await request.json());   // throws SignalRejectedError on anything else
+```
+
+A schema is anything with a `parse(payload)` method, which is zod's shape and
+nothing more, so the library a caller already uses stays theirs and none of
+them is a dependency here. A hand-written `{ parse }` works just as well.
+
+**The check happens on the way in, once.** `engine.signal` is where a payload
+crosses into a run, so a payload that fails is refused there: nothing is
+appended to history, nothing is buffered, and the run is left exactly as the
+wait found it. Everything in `pendingSignals` and in history below is therefore
+a value some schema approved, which is what lets `ctx.waitFor` return the
+schema's output type without parsing it again — a second check could only
+disagree with the record it was reading, and a schema tightened under a live run
+would fail that run rather than the deploy that tightened it.
+
+**A schema is a gate, not a codec.** What gets recorded is what the schema
+returned, so defaults and coercions reach the workflow. What history holds is
+JSON, so a schema whose output is not — a `Date`, a `Map`, a class instance —
+comes back as the JSON of it on the next replay, typed as the thing it no
+longer is. Keep the output JSON-shaped and parse the rest inside a step.
+
+**An endpoint has a name, not a definition.** Register the signals with the
+engine and `engine.signal(runId, "manual-review", payload)` is checked too:
+
+```ts
+const engine = new Engine({ store, workflows, signals: [approval] });
+```
+
+A name with no registered schema is unvalidated rather than refused. That is
+what keeps an untyped `ctx.waitFor("whatever")` working, and it is also load
+bearing: the signal a child reports its outcome on is derived from its run id,
+so there is no schema for the engine to hold it to.
+
+**A refusal is recorded on the run, and it is not history.** Not touching
+history is the guarantee, so the record carries a capped list of refusals
+beside it, which `engine.view` reports:
+
+```ts
+const view = await engine.view(runId);
+// rejectedSignals: [{ name: "manual-review", error: "approved: expected boolean, received string", at: 1800000001000 }]
+```
+
+That is the answer to the one question a refusal creates — this run is still
+waiting for a signal somebody insists they sent — and the timeline cannot give
+it, because the payload never got that far. The payload itself is deliberately
+not kept: it came from outside and has just been established not to be a shape
+anything here understands. Only the most recent ten are, so a caller retrying a
+malformed payload in a loop cannot grow the record without bound.
+
 ## Sagas
 
 A step that fails for good throws `StepFailedError` *into* the workflow
@@ -478,7 +549,9 @@ so they cannot drift.
 
 **Signals that arrive early are not lost.** `engine.signal()` on a run that has
 not reached the matching `waitFor` yet buffers the payload; the `waitFor`
-consumes it when it gets there, in order.
+consumes it when it gets there, in order. A buffered payload has been through
+its schema already — the check is on the way in, not on the way out — so what
+is waiting there is never a shape the workflow cannot read.
 
 **Concurrency is optimistic and enforced by the store.** Every persisted change
 bumps `version`; `save()` is `UPDATE … WHERE version = expected`. Two workers
@@ -552,6 +625,7 @@ src/
   view.ts         a run rendered for an admin screen: blockedOn + history as a timeline
   children.ts     how a parent names its child and the signal the engine answers on
   saga.ts         the undos a failing run owes, newest first, and how it reports them
+  signals.ts      a signal's name and schema in one value, and the refusals a run keeps
   hooks.ts        the lifecycle payloads, and the call that cannot fail a run
   schedule.ts     the period a clock reading falls in, and the id that period's run takes
   continuation.ts a chain's root, a run's generation, and the id the next one takes
@@ -559,11 +633,11 @@ src/
   stores/sqlite.ts     the same record on a file: one writer, so claiming is one statement
   stores/postgres.ts   JSONB record + mirrored query columns + SKIP LOCKED claim
 tests/
-  engine.test.ts        85 tests with a hand-driven clock: memoisation, durable
+  engine.test.ts        95 tests with a hand-driven clock: memoisation, durable
                         backoff, early signals, timeouts, nondeterminism, leases,
                         listing, the run view, child runs, compaction, the
-                        lifecycle hooks, scheduled starts, continuations and
-                        saga compensation
+                        lifecycle hooks, scheduled starts, continuations,
+                        saga compensation and typed signals
   sqlite.test.ts        9 tests on a real file: a run resumed after the process
                         that started it is gone, stale writes, leases across two
                         connections, keyset paging
@@ -602,6 +676,13 @@ CI runs the full suite, Postgres included, on every push.
   its function, so cancelling undoes nothing. Unwinding a saga on purpose is a
   decision about state that the workflow has to make: signal it, and let the
   function take the path that ends the run itself.
+- **Re-checking a payload that is already in the run.** A schema is applied
+  where a payload enters, so one that was buffered before its signal had a
+  schema — or sent by a name the engine had no registration for — stays as it
+  arrived, and tightening a schema does not refuse the runs already holding the
+  old shape. Validating on the way out instead would put the engine in the
+  position of failing a live run over a deploy it cannot see, which is what
+  `version` is for.
 - **Durable hook delivery.** A lifecycle hook is an in-process call made after
   the write it reports; a worker that dies in between emits nothing, and nothing
   replays it. A side effect that must not be lost goes in the workflow as a step.
