@@ -8,6 +8,7 @@ import {
   ConflictError,
   NondeterminismError,
   RunNotFoundError,
+  SignalRejectedError,
   Suspend,
   errorMessage,
 } from "./errors.js";
@@ -15,7 +16,7 @@ import { type LifecycleHooks, notify, runEvent } from "./hooks.js";
 import { DEFAULT_RETRY } from "./retry.js";
 import { compensatedError, runCompensations } from "./saga.js";
 import { type ScheduleOptions, type ScheduledRun, schedulePeriod, scheduleRunId } from "./schedule.js";
-import { type SignalDefinition, SignalRegistry, signalName } from "./signals.js";
+import { type SignalDefinition, SignalRegistry, recordRejection, signalName } from "./signals.js";
 import type { ChildHandle, RetryPolicy, RunPage, RunQuery, RunRecord, RunStore, WorkflowDefinition } from "./types.js";
 import { type RunView, renderRun } from "./view.js";
 import { WorkflowRegistry, runVersion } from "./versions.js";
@@ -204,9 +205,10 @@ export class Engine {
     const run = await this.live(id);
     if (TERMINAL.has(run.status)) throw new Error(`run ${run.id} is ${run.status}; cannot signal`);
     const name = signalName(target);
+    const checked = await this.check(run, target, payload);
 
     if (run.waitingFor?.name === name) {
-      appendEvent(run, { call: run.waitingFor.call, type: "signal.received", name, payload }, this.now());
+      appendEvent(run, { call: run.waitingFor.call, type: "signal.received", name, payload: checked }, this.now());
       run.waitingFor = null;
       run.wakeAt = null;
       run.status = "running";
@@ -214,9 +216,42 @@ export class Engine {
       return this.tick(run.id);
     }
 
-    (run.pendingSignals[name] ??= []).push(payload);
+    (run.pendingSignals[name] ??= []).push(checked);
     await this.persist(run);
     return run;
+  }
+
+  /**
+   * Check a payload against the signal's schema and return what the schema
+   * made of it, or refuse it. This is the only place a payload is validated:
+   * the run is entered here, so everything in `pendingSignals` and in history
+   * below is a value some schema already approved — which is what lets
+   * ctx.waitFor return the schema's type without parsing again, where it could
+   * only disagree with the record.
+   *
+   * A definition the caller handed over is used whether or not the engine
+   * knows it; a bare name is checked only if a schema is registered for it,
+   * because the alternative would refuse every untyped signal and every
+   * outcome a child reports.
+   */
+  private async check(run: RunRecord, target: SignalDefinition<unknown> | string, payload: unknown): Promise<unknown> {
+    const definition = typeof target === "string" ? this.signals.get(target) : target;
+    if (!definition) return payload;
+    try {
+      return definition.parse(payload);
+    } catch (err) {
+      const reason = errorMessage(err);
+      recordRejection(run, { name: definition.name, error: reason, at: this.now() });
+      try {
+        await this.persist(run);
+      } catch (persistErr) {
+        // The audit line is worth losing to a concurrent writer; the answer to
+        // the caller is not. Another worker moving the run on does not make a
+        // payload this one refused delivered.
+        if (!(persistErr instanceof ConflictError)) throw persistErr;
+      }
+      throw new SignalRejectedError(definition.name, reason, { cause: err });
+    }
   }
 
   async cancel(id: string): Promise<RunRecord> {
