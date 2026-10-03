@@ -24,6 +24,25 @@ export class StepFailedError extends Error {
 }
 
 /**
+ * One attempt at a step — or at an undo — ran past its `timeoutMs` and was
+ * abandoned. It never reaches workflow code on its own: the frontier records it
+ * as a failed attempt and retries like any other failure, so this arrives as
+ * the `cause` of the StepFailedError the last attempt throws, where code that
+ * treats a hang differently from a refusal can tell the two apart.
+ */
+export class StepTimeoutError extends Error {
+  override readonly name = "StepTimeoutError";
+  constructor(
+    readonly step: string,
+    readonly timeoutMs: number,
+  ) {
+    // The step is named by the history event and by the error that wraps this
+    // one, so the message says only what the attempt did.
+    super(`timed out after ${timeoutMs}ms`);
+  }
+}
+
+/**
  * A registered undo exhausted its retries, so the work it was there to undo is
  * still done. It never reaches workflow code — the function has already unwound
  * by the time compensations run — so the engine is what catches it, records the

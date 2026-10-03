@@ -12,6 +12,7 @@ import {
   SignalRejectedError,
   StepFailedError,
   type StepFailedEvent,
+  StepTimeoutError,
   WaitTimeoutError,
   defineSignal,
   defineWorkflow,
@@ -1781,5 +1782,108 @@ describe("typed signals", () => {
   it("refuses two schemas for one signal name", async () => {
     const other = defineSignal("approve", { parse: (payload: unknown) => payload });
     expect(() => harness([review], { signals: [approval, other] })).toThrow(/registered twice/);
+  });
+});
+
+describe("step timeouts", () => {
+  /**
+   * A hang, as a workflow would meet one: a call that never answers. It holds
+   * no timer and no socket, so a test can abandon an attempt and still exit.
+   */
+  const hang = () => new Promise<never>(() => {});
+
+  it("turns a hung attempt into a retryable failure with an event of its own", async () => {
+    let attempts = 0;
+    const wf = defineWorkflow<null, string>("fetch", async (ctx) =>
+      ctx.step("call-api", () => (++attempts === 1 ? hang() : "ok"), { timeoutMs: 20 }),
+    );
+    const { engine, advance } = harness([wf]);
+    const id = await engine.start(wf, null);
+
+    // The harness clock never moves during the step, so the attempt was bounded
+    // in wall-clock time rather than by anything the engine reads off its clock.
+    let run = await engine.settle(id);
+    expect(attempts).toBe(1);
+    expect(run.status).toBe("sleeping");
+    expect(run.wakeAt).toBe(T0 + 1_000); // the step's own backoff, not a lease expiry
+    expect(run.history).toMatchObject([
+      { type: "step.failed", name: "call-api", attempt: 1, error: "timed out after 20ms", retryAt: T0 + 1_000 },
+    ]);
+
+    advance(1_000);
+    run = await engine.settle(id);
+    expect(run.status).toBe("completed");
+    expect(run.output).toBe("ok");
+    expect(attempts).toBe(2);
+  });
+
+  it("fails the run once the attempts are spent, with both of them on the timeline", async () => {
+    const wf = defineWorkflow<null, void>("doomed", async (ctx) => {
+      await ctx.step("call-api", hang, { timeoutMs: 20, retry: { maxAttempts: 2 } });
+    });
+    const { engine, advance } = harness([wf]);
+    const id = await engine.start(wf, null);
+
+    await engine.settle(id);
+    advance(1_000);
+    const run = await engine.settle(id);
+
+    expect(run.status).toBe("failed");
+    expect(run.error).toBe('step "call-api" failed after 2 attempt(s): timed out after 20ms');
+    const view = await engine.view(id);
+    expect(view?.timeline.map((e) => e.summary)).toEqual([
+      'step "call-api" failed on attempt 1, retrying: timed out after 20ms',
+      'step "call-api" failed on attempt 2, no attempts left: timed out after 20ms',
+    ]);
+  });
+
+  it("hands the workflow the timeout as the cause, so a hang is not a refusal", async () => {
+    const wf = defineWorkflow<null, string>("supervised", async (ctx) => {
+      try {
+        return await ctx.step("call-api", hang, { timeoutMs: 20, retry: { maxAttempts: 1 } });
+      } catch (err) {
+        if (!(err instanceof StepFailedError)) throw err;
+        if (!(err.cause instanceof StepTimeoutError)) return "failed";
+        return `hung for ${err.cause.timeoutMs}ms`;
+      }
+    });
+    const { engine } = harness([wf]);
+    const id = await engine.start(wf, null);
+    const run = await engine.settle(id);
+
+    expect(run.status).toBe("completed");
+    expect(run.output).toBe("hung for 20ms");
+  });
+
+  it("leaves an attempt that answers inside its timeout alone", async () => {
+    const wf = defineWorkflow<null, string>("quick", async (ctx) =>
+      ctx.step("call-api", async () => "ok", { timeoutMs: 60_000 }),
+    );
+    const { engine } = harness([wf]);
+    const id = await engine.start(wf, null);
+    const run = await engine.settle(id);
+
+    expect(run.status).toBe("completed");
+    expect(run.output).toBe("ok");
+    expect(run.history.map((e) => e.type)).toEqual(["step.completed"]);
+  });
+
+  it("bounds an undo the same way, so a hung compensation does not strand the phase", async () => {
+    const wf = defineWorkflow<null, void>("checkout", async (ctx) => {
+      await ctx.step("charge", () => "ok");
+      ctx.compensate("refund", hang, { timeoutMs: 20, retry: { maxAttempts: 1 } });
+      await ctx.step("ship", () => {
+        throw new Error("no courier");
+      }, { retry: { maxAttempts: 1 } });
+    });
+    const { engine } = harness([wf]);
+    const id = await engine.start(wf, null);
+    const run = await engine.settle(id);
+
+    expect(run.status).toBe("failed");
+    expect(run.error).toBe(
+      'step "ship" failed after 1 attempt(s): no courier; compensation did not complete: "refund" (timed out after 20ms)',
+    );
+    expect(run.history.map((e) => e.type)).toEqual(["step.completed", "step.failed", "compensation.failed"]);
   });
 });

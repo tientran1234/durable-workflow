@@ -124,6 +124,17 @@ export interface RetryPolicy {
 
 export interface StepOptions {
   retry?: Partial<RetryPolicy>;
+  /**
+   * Wall-clock bound on one attempt. An attempt still running after this long
+   * is abandoned and recorded as a failed attempt, retried under `retry` like
+   * any other failure.
+   *
+   * Unbounded by default, which is the only shape a hang has without it: the
+   * worker sits in the step holding its lease, and when the lease expires
+   * another worker replays the run and calls the same function again, with
+   * nothing on the record to say that is what happened.
+   */
+  timeoutMs?: number;
 }
 
 /**
@@ -162,6 +173,9 @@ export interface WorkflowContext<Input> {
   /**
    * Run `fn` at most once per run. On replay a completed step returns its
    * stored result without calling `fn`. Results must be JSON-serialisable.
+   *
+   * `timeoutMs` bounds one attempt rather than the step: a call that hangs
+   * fails that attempt and retries under the step's own policy.
    */
   step<T>(name: string, fn: () => Promise<T> | T, options?: StepOptions): Promise<T>;
   /**

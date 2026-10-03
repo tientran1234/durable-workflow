@@ -66,6 +66,7 @@ export {
   RunNotFoundError,
   SignalRejectedError,
   StepFailedError,
+  StepTimeoutError,
   WaitTimeoutError,
   WorkflowNotFoundError,
 } from "./errors.js";
