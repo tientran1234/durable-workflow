@@ -51,6 +51,46 @@ in microseconds and resumes exactly where it was.
 waiting for, persist, and unwind the function by throwing a control-flow
 sentinel. The run costs nothing until a signal arrives or the timer is due.
 
+## Step timeouts
+
+A step that fails says so. A step that *hangs* — a socket with no read timeout,
+a lock nobody releases — says nothing: the worker sits inside `fn`, the run's
+lease runs out, and because a `running` run with no live lease is due again,
+another worker replays it and calls the same function. The run moves when one of
+those laps happens to return, and not at all if none of them does — with one
+attempt on its history the whole time.
+
+`timeoutMs` bounds one attempt:
+
+```ts
+await ctx.step("charge", () => stripe.charge(orderId), {
+  timeoutMs: 10_000,
+  retry: { maxAttempts: 5 },
+});
+```
+
+An attempt still running after 10s is abandoned and recorded as a failed
+attempt — `step.failed` with `timed out after 10000ms`, the attempt counted,
+the backoff persisted, `onStepFailed` fired. From there it is an ordinary
+failure: four more attempts, then `StepFailedError` into the workflow. The
+timeout is the `cause` of that error, so code that treats a hang differently
+from a refusal can ask:
+
+```ts
+catch (err) {
+  if (err instanceof StepFailedError && err.cause instanceof StepTimeoutError) { … }
+}
+```
+
+The bound is per attempt, not per step, and it applies to an undo too — a
+`ctx.compensate` takes the same options, and a hung undo is the worse hang,
+since the run is already failing and the phase is waiting on it.
+
+**Keep it well under the engine's `leaseMs`** (30s by default). The timeout is
+what makes a hang the step's problem rather than the lease's; set it longer than
+the lease and the lease still expires first, which is the behaviour it was there
+to replace.
+
 ## Typed signals
 
 A signal is the one input to a run that comes from outside TypeScript — an
@@ -547,6 +587,13 @@ restarts.
 a process dying mid-wait loses nothing. Attempt counts are derived from history,
 so they cannot drift.
 
+**A step timeout is the one thing here that is not durable.** Everything else
+that waits is a persisted wake time; `timeoutMs` is a real `setTimeout` in the
+worker. A durable deadline can only be noticed on a later tick, and the tick is
+what is stuck — so the instrument has to live in the process that is hung, and
+nothing of it needs to survive a restart, because a restart already ends the
+attempt it was bounding.
+
 **Signals that arrive early are not lost.** `engine.signal()` on a run that has
 not reached the matching `waitFor` yet buffers the payload; the `waitFor`
 consumes it when it gets there, in order. A buffered payload has been through
@@ -618,6 +665,7 @@ src/
   context.ts      replay: each ctx call finds its own event or becomes the frontier
   engine.ts       start / tick / signal / cancel / worker; lease + execute
   retry.ts        backoff policy
+  timeout.ts      the wall-clock bound on one attempt, and why it is not the engine's clock
   due.ts          what "due" means, shared by engine and stores
   versions.ts     the registry: definitions by name and version, and a run's pin
   list.ts         listing order and cursor codec, shared by engine and stores
@@ -633,11 +681,11 @@ src/
   stores/sqlite.ts     the same record on a file: one writer, so claiming is one statement
   stores/postgres.ts   JSONB record + mirrored query columns + SKIP LOCKED claim
 tests/
-  engine.test.ts        95 tests with a hand-driven clock: memoisation, durable
+  engine.test.ts        100 tests with a hand-driven clock: memoisation, durable
                         backoff, early signals, timeouts, nondeterminism, leases,
                         listing, the run view, child runs, compaction, the
                         lifecycle hooks, scheduled starts, continuations,
-                        saga compensation and typed signals
+                        saga compensation, typed signals and step timeouts
   sqlite.test.ts        9 tests on a real file: a run resumed after the process
                         that started it is gone, stale writes, leases across two
                         connections, keyset paging
@@ -683,6 +731,14 @@ CI runs the full suite, Postgres included, on every push.
   old shape. Validating on the way out instead would put the engine in the
   position of failing a live run over a deploy it cannot see, which is what
   `version` is for.
+- **Cancelling the work a step timeout abandoned.** `timeoutMs` stops waiting
+  for the call; it cannot stop the call, because a promise is not interruptible
+  and nothing here is handed an `AbortSignal` to pass on. The abandoned work may
+  still finish, and the retry may do the same thing a second time — so a step
+  with a timeout wants the same idempotency key a step that retries already
+  wants. Threading cancellation through would mean a second signature for `fn`
+  and a cooperating client on the other end of it; the client's own request
+  timeout is that, where it exists.
 - **Durable hook delivery.** A lifecycle hook is an in-process call made after
   the write it reports; a worker that dies in between emits nothing, and nothing
   replays it. A side effect that must not be lost goes in the workflow as a step.

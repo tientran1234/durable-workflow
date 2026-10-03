@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-03
+
+- Step timeouts: `ctx.step(name, fn, { timeoutMs })` — a hung step becomes a retryable failure with its own history event instead of a lease that expires silently, so a call that never answers is bounded, counted against the step's own retry policy and visible on the timeline, rather than leaving the run quiet until another worker replays it into the same hang.
+
 ## 2026-10-02
 
 - Typed signals: `defineSignal("approve", zodSchema)` so `waitFor` returns the parsed type and `engine.signal` rejects invalid payloads before they touch history, and the rejection is recorded on the run — so a payload from an admin endpoint or a webhook is checked where it enters the run rather than surfacing as a failure somewhere below the wait, and a run still waiting for a signal somebody insists they sent says why on `engine.view`.
