@@ -12,6 +12,7 @@ import {
 import { type LifecycleHooks, notify, runEvent } from "./hooks.js";
 import { DEFAULT_RETRY, backoffMs } from "./retry.js";
 import { type SignalDefinition, signalName } from "./signals.js";
+import { withTimeout } from "./timeout.js";
 import type {
   ChildHandle,
   ChildOutcome,
@@ -188,7 +189,10 @@ export function createContext<Input>(run: RunRecord, deps: ContextDeps): ReplayC
 
     const attempt = failures.length + 1;
     try {
-      const result = await fn();
+      const timeoutMs = options?.timeoutMs;
+      // The bound is per attempt, not per step: the retries below are a
+      // succession of attempts, and each gets the whole of it.
+      const result = timeoutMs === undefined ? await fn() : await withTimeout(name, timeoutMs, fn);
       push(completedEvent(kind, c, name, result));
       await deps.persist(run);
       return result;
