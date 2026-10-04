@@ -89,6 +89,12 @@ export class Engine {
       chain?: RunRecord["chain"];
       /** Set by ctx.continueAsNew: what the predecessor had buffered and never consumed. */
       pendingSignals?: Record<string, unknown[]>;
+      /**
+       * The application's own names for this run — an order id, a tenant — to
+       * find it by later with `list({ tag })`. Normalized here and fixed for
+       * the run's life.
+       */
+      tags?: readonly string[];
     } = {},
   ): Promise<string> {
     const definition =

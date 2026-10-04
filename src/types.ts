@@ -95,6 +95,13 @@ export interface RunRecord {
    * compaction existed.
    */
   snapshot?: HistorySnapshot;
+  /**
+   * What this run is about, in the application's own names — an order id, a
+   * tenant — set at start and immutable after it. Indexed by every store, so
+   * `engine.list({ tag })` finds the run without its id. Absent when the run
+   * was started without any, which is most runs.
+   */
+  tags?: string[];
   /** Signals that arrived before the workflow reached the matching waitFor. */
   pendingSignals: Record<string, unknown[]>;
   /**
@@ -254,6 +261,8 @@ export function defineWorkflow<Input, Output>(
 export interface RunQuery {
   workflow?: string;
   status?: RunStatus;
+  /** Runs carrying this tag. Matched whole and exactly, after trimming. */
+  tag?: string;
   /** Page size. Defaults to 50, capped at 500. */
   limit?: number;
   /** Opaque position from the previous page's `cursor`. */
@@ -283,6 +292,10 @@ export interface RunStore {
    * A page of runs matching `query`, ordered by (createdAt, id) descending.
    * The order is part of the contract: it is what lets a cursor name an exact
    * position instead of an offset that shifts as new runs are created.
+   *
+   * `query.tag` must be answered from an index rather than by reading runs:
+   * finding the run for one order is the one listing an operator does while
+   * every other run in the table is irrelevant.
    */
   list(query: RunQuery): Promise<RunPage>;
 }

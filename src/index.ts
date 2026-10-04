@@ -47,6 +47,9 @@ export type { ScheduleOptions, ScheduledRun } from "./schedule.js";
 export { MAX_REJECTED_SIGNALS, defineSignal, signalName } from "./signals.js";
 export type { SignalDefinition, SignalSchema } from "./signals.js";
 
+// Tags: the application's names for a run, and what a store must index them as.
+export { MAX_TAGS, MAX_TAG_LENGTH, hasTag, normalizeTags, queryTag } from "./tags.js";
+
 export { renderRun } from "./view.js";
 export type { RunBlockedOn, RunView, TimelineEntry } from "./view.js";
 

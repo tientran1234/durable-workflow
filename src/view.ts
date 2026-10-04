@@ -50,6 +50,8 @@ export interface RunView {
   output: unknown;
   error: string | null;
   blockedOn: RunBlockedOn | null;
+  /** The application's names for this run, as `list({ tag })` matches them. */
+  tags: string[];
   /** Signals buffered ahead of their waitFor, by name, with how many payloads each. */
   pendingSignals: Record<string, number>;
   /**
@@ -83,6 +85,7 @@ export function renderRun(run: RunRecord): RunView {
     output: run.output,
     error: run.error,
     blockedOn: blockedOn(run),
+    tags: run.tags ?? [],
     pendingSignals: Object.fromEntries(
       Object.entries(run.pendingSignals).map(([name, payloads]) => [name, payloads.length]),
     ),

@@ -4,6 +4,8 @@ import {
   type ChildHandle,
   ConflictError,
   MAX_REJECTED_SIGNALS,
+  MAX_TAGS,
+  MAX_TAG_LENGTH,
   NondeterminismError,
   type RunCompletedEvent,
   type RunFailedEvent,
@@ -504,6 +506,109 @@ describe("listing", () => {
     expect((await engine.list({ limit: 0 })).runs).toHaveLength(1);
     expect((await engine.list({ limit: 10_000 })).runs).toHaveLength(2);
     await expect(engine.list({ cursor: "not-a-cursor" })).rejects.toThrow(/invalid cursor/);
+  });
+});
+
+describe("tags", () => {
+  const counter = defineWorkflow<null, number>("counter", async (ctx) => ctx.step("one", () => 1));
+  const waiter = defineWorkflow<null, void>("waiter", async (ctx) => {
+    await ctx.waitFor("go");
+  });
+
+  it("finds the run for an order without knowing its id", async () => {
+    const { engine } = harness([counter, waiter]);
+    await engine.start(counter, null, { id: "c1", tags: ["order:4182", "tenant:acme"] });
+    await engine.start(counter, null, { id: "c2", tags: ["order:9001", "tenant:acme"] });
+    await engine.start(waiter, null, { id: "w1", tags: ["order:4182"] });
+
+    expect((await engine.list({ tag: "order:4182" })).runs.map((r) => r.id)).toEqual(["w1", "c1"]);
+    expect((await engine.list({ tag: "tenant:acme" })).runs.map((r) => r.id)).toEqual(["c2", "c1"]);
+    expect((await engine.list({ tag: "order:nope" })).runs).toEqual([]);
+  });
+
+  it("narrows by tag alongside workflow and status", async () => {
+    const { engine } = harness([counter, waiter]);
+    await engine.start(counter, null, { id: "c1", tags: ["order:1"] });
+    const w = await engine.start(waiter, null, { id: "w1", tags: ["order:1"] });
+    // Same workflow and same status as w1, different order: only the tag parts them.
+    const other = await engine.start(waiter, null, { id: "w2", tags: ["order:2"] });
+    await engine.settle(w);
+    await engine.settle(other);
+
+    expect((await engine.list({ tag: "order:1", workflow: "waiter" })).runs.map((r) => r.id)).toEqual(["w1"]);
+    expect((await engine.list({ tag: "order:1", status: "waiting" })).runs.map((r) => r.id)).toEqual(["w1"]);
+    expect((await engine.list({ tag: "order:1", workflow: "counter", status: "waiting" })).runs).toEqual([]);
+  });
+
+  it("leaves an untagged run out of every tag query but not out of the listing", async () => {
+    const { engine } = harness([counter]);
+    await engine.start(counter, null, { id: "plain" });
+    await engine.start(counter, null, { id: "tagged", tags: ["order:1"] });
+
+    expect((await engine.get("plain"))?.tags).toBeUndefined();
+    expect((await engine.list({ tag: "order:1" })).runs.map((r) => r.id)).toEqual(["tagged"]);
+    expect((await engine.list()).runs.map((r) => r.id)).toEqual(["tagged", "plain"]);
+  });
+
+  it("stores tags trimmed, deduplicated and sorted, and matches a query the same way", async () => {
+    const { engine } = harness([counter]);
+    await engine.start(counter, null, { id: "r1", tags: ["  tenant:acme ", "order:1", "tenant:acme"] });
+
+    expect((await engine.get("r1"))?.tags).toEqual(["order:1", "tenant:acme"]);
+    expect((await engine.list({ tag: " order:1  " })).runs.map((r) => r.id)).toEqual(["r1"]);
+  });
+
+  it("refuses a tag it could not index rather than dropping it", async () => {
+    const { engine } = harness([counter]);
+    const startWith = (tags: string[]) => engine.start(counter, null, { tags });
+
+    await expect(startWith(["ok", "   "])).rejects.toThrow(/tag cannot be empty/);
+    await expect(startWith(["x".repeat(MAX_TAG_LENGTH + 1)])).rejects.toThrow(
+      new RegExp(`longer than ${MAX_TAG_LENGTH}`),
+    );
+    await expect(startWith(Array.from({ length: MAX_TAGS + 1 }, (_, i) => `t${i}`))).rejects.toThrow(/at most/);
+    // Refused at the door: nothing was created under a tag that would not match.
+    expect((await engine.list()).runs).toEqual([]);
+    await expect(engine.list({ tag: " " })).rejects.toThrow(/tag cannot be empty/);
+  });
+
+  it("pages a tag query by keyset, without repeating or skipping a run", async () => {
+    const { engine } = harness([counter]);
+    for (const id of ["r1", "r2", "r3", "r4", "r5"]) {
+      // Every other run carries the tag, so a filter applied after the page
+      // limit — rather than inside the query — would short the pages.
+      await engine.start(counter, null, { id, tags: Number(id.slice(1)) % 2 === 1 ? ["odd"] : ["even"] });
+    }
+
+    const first = await engine.list({ tag: "odd", limit: 2 });
+    expect(first.runs.map((r) => r.id)).toEqual(["r5", "r3"]);
+    const second = await engine.list({ tag: "odd", limit: 2, cursor: first.cursor ?? "" });
+    expect(second.runs.map((r) => r.id)).toEqual(["r1"]);
+    expect(second.cursor).toBeNull();
+  });
+
+  it("carries tags into the generations a continuation hands the work to", async () => {
+    const batches = defineWorkflow<number, number>("batches", async (ctx, left) => {
+      await ctx.step("batch", () => left);
+      return left > 1 ? ctx.continueAsNew(left - 1) : left;
+    });
+    const { engine } = harness([batches]);
+    await engine.start(batches, 3, { id: "r1", tags: ["order:4182"] });
+    expect((await engine.settle("r1")).id).toBe("r1~3");
+
+    // The chain is one piece of work, so the tag an operator searches by has to
+    // reach the generation actually doing it — not only the one they started.
+    expect((await engine.get("r1~3"))?.tags).toEqual(["order:4182"]);
+    expect((await engine.list({ tag: "order:4182" })).runs.map((r) => r.id)).toEqual(["r1~3", "r1~2", "r1"]);
+  });
+
+  it("shows a found run's tags on its view", async () => {
+    const { engine } = harness([counter]);
+    await engine.start(counter, null, { id: "r1", tags: ["order:1"] });
+    await engine.start(counter, null, { id: "r2" });
+
+    expect((await engine.view("r1"))?.tags).toEqual(["order:1"]);
+    expect((await engine.view("r2"))?.tags).toEqual([]);
   });
 });
 
