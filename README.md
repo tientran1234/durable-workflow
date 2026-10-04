@@ -430,6 +430,39 @@ runs are being created — an offset would skip or repeat rows. Cursors are
 opaque; pass back what the previous page returned. `limit` defaults to 50 and
 is capped at 500.
 
+## Tags
+
+A run id is the engine's name for a run. An operator arrives holding the
+application's — order 4182 — so tag the run with it at start and find it by
+that later.
+
+```ts
+await engine.start(fulfilment, { orderId: "ord_4182" }, { tags: ["order:ord_4182", "tenant:acme"] });
+
+const { runs } = await engine.list({ tag: "order:ord_4182" });     // which run is handling this?
+await engine.list({ tag: "tenant:acme", status: "waiting", limit: 20 });   // and what is stuck
+```
+
+A tag query narrows alongside `workflow` and `status` and pages by the same
+cursor as any other listing. Tags are plain strings with no structure the
+engine knows about; `order:` above is a convention, not syntax.
+
+Tags are fixed when the run starts. They say what the run is about, which is
+settled before the first step, and both durable stores mirror them into an
+index at that point and never have to revisit it. The index is keyed
+`(tag, created_at DESC, run_id DESC)` — the tag, then the order listings come
+out in — so a tag query seeks once and reads the page it returns, whether the
+tag matches one run or a million. Tags also follow `ctx.continueAsNew` into the
+next generation, since the chain is one piece of work under one set of names; a
+child run is its own work and starts untagged.
+
+A tag that could not be indexed is refused at `engine.start` rather than
+dropped: empty, longer than 128 characters, or more than 16 on one run. The
+failure mode worth avoiding is an operator searching for a run they cannot
+find. Duplicates collapse, and whitespace around a tag is trimmed both
+where it is stored and where it is matched, so `" order:1 "` and `"order:1"`
+are the same tag.
+
 ## Hooks
 
 `engine.list` and `engine.view` answer a question when you ask it. Hooks are the
@@ -654,8 +687,9 @@ why many workers still want Postgres.
 
 Any `RunStore` implementation with `create / get / save(version) / claimDue /
 list` works. `save` must be conditional on `version`, `claimDue` must lease
-atomically, and `list` must order by `(createdAt, id)` descending — that is the
-whole contract.
+atomically, `list` must order by `(createdAt, id)` descending, and a
+`list({ tag })` must be answered from an index rather than by reading runs —
+that is the whole contract.
 
 ## Layout
 
@@ -669,6 +703,7 @@ src/
   due.ts          what "due" means, shared by engine and stores
   versions.ts     the registry: definitions by name and version, and a run's pin
   list.ts         listing order and cursor codec, shared by engine and stores
+  tags.ts         what a tag may be, and why a store indexes them at create
   compaction.ts   folding a settled history prefix into a snapshot replay indexes
   view.ts         a run rendered for an admin screen: blockedOn + history as a timeline
   children.ts     how a parent names its child and the signal the engine answers on
@@ -680,17 +715,18 @@ src/
   stores/memory.ts
   stores/sqlite.ts     the same record on a file: one writer, so claiming is one statement
   stores/postgres.ts   JSONB record + mirrored query columns + SKIP LOCKED claim
+                       both keep a (tag, run) table beside the record, indexed in listing order
 tests/
   engine.test.ts        100 tests with a hand-driven clock: memoisation, durable
                         backoff, early signals, timeouts, nondeterminism, leases,
                         listing, the run view, child runs, compaction, the
                         lifecycle hooks, scheduled starts, continuations,
-                        saga compensation, typed signals and step timeouts
-  sqlite.test.ts        9 tests on a real file: a run resumed after the process
+                        saga compensation, typed signals, step timeouts and tags
+  sqlite.test.ts        11 tests on a real file: a run resumed after the process
                         that started it is gone, stale writes, leases across two
-                        connections, keyset paging
+                        connections, keyset paging, and the plan a tag query gets
   postgres.integration.test.ts   disjoint claims across concurrent workers, stale
-                        writes, keyset paging
+                        writes, keyset paging, and the plan a tag query gets
 ```
 
 ## Run
@@ -712,8 +748,15 @@ CI runs the full suite, Postgres included, on every push.
 - **A view over a whole continuation chain.** `engine.list` and `engine.view`
   answer about one run, and a chain is a run per generation, so an operator
   following one walks it by id — `run-1`, `run-1~2` — rather than reading it as
-  a single timeline. Stitching them is a query over `chain.root`, which is the
-  store's job and not this library's.
+  a single timeline. A tag names every generation at once, which is how to get
+  the chain's runs back in one query; stitching their timelines into one is
+  still the caller's job.
+- **Retagging a run, and matching several tags at once.** `engine.start` is the
+  only place tags are set and `engine.list` takes one tag, not a set. Tags are
+  the run's identity in the application's terms, which does not change while it
+  runs; a mutable set of them is a labelling system, with a second write path
+  into the index and a question about what a tag meant at the time. Narrow a
+  tag query further with `workflow` and `status`, or filter the page.
 - **Continuing a run from outside it.** `ctx.continueAsNew` is a decision the
   workflow makes about its own state, and only the workflow knows what the next
   generation needs to be handed. There is no `engine.continueAsNew`; cancelling

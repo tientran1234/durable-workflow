@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-04
+
+- Tags and search: `engine.start(wf, input, { tags })` and `engine.list({ tag })`, indexed on both stores, so an operator finds the run for order X without knowing its id — the tag index carries the listing order too, so the query seeks once and reads the page it returns instead of walking every run newest-first to find the one that matters.
+
 ## 2026-10-03
 
 - Step timeouts: `ctx.step(name, fn, { timeoutMs })` — a hung step becomes a retryable failure with its own history event instead of a lease that expires silently, so a call that never answers is bounded, counted against the step's own retry policy and visible on the timeline, rather than leaving the run quiet until another worker replays it into the same hang.
