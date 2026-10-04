@@ -1,5 +1,6 @@
 import type { Database } from "better-sqlite3";
 import { decodeCursor, encodeCursor, pageLimit } from "../list.js";
+import { queryTag } from "../tags.js";
 import type { RunPage, RunQuery, RunRecord, RunStore } from "../types.js";
 
 interface Row {
@@ -12,17 +13,23 @@ interface Row {
 
 /**
  * SQLite-backed store for a single node: the same shape as the Postgres one —
- * the full record as JSON, the columns a worker queries by mirrored beside it —
- * on a file instead of a server.
+ * the full record as JSON, the columns a worker queries by mirrored beside it,
+ * a run's tags mirrored into a table beside that — on a file instead of a
+ * server.
  *
  * `better-sqlite3` is an optional peer dependency — install it only if you use
  * this store.
  */
 export class SqliteStore implements RunStore {
+  /** The tag index, the same row per (tag, run) the Postgres store keeps. */
+  private readonly tagTable: string;
+
   constructor(
     private readonly db: Database,
     private readonly table = "workflow_runs",
-  ) {}
+  ) {
+    this.tagTable = `${table}_tags`;
+  }
 
   /**
    * Idempotent. Run once at startup. It also sets the two pragmas the
@@ -51,15 +58,35 @@ export class SqliteStore implements RunStore {
     this.db.exec(
       `CREATE INDEX IF NOT EXISTS ${this.table}_recent ON ${this.table} (created_at DESC, id DESC)`,
     );
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS ${this.tagTable} (
+        tag        TEXT NOT NULL,
+        run_id     TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (tag, run_id)
+      )`);
+    // The tag first, then the listing order: one seek to the tag and the rows
+    // come out newest-first, so a tag query reads a page and stops.
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS ${this.tagTable}_recent ON ${this.tagTable} (tag, created_at DESC, run_id DESC)`,
+    );
   }
 
+  /**
+   * The record and its index rows in one transaction, for the reason the
+   * Postgres store puts them in one statement: a run that exists without its
+   * tags is a run an operator cannot find.
+   */
   async create(run: RunRecord): Promise<void> {
-    this.db
-      .prepare(
-        `INSERT INTO ${this.table} (id, workflow, status, wake_at, lease_until, version, data, created_at, updated_at)
+    const insertRun = this.db.prepare(
+      `INSERT INTO ${this.table} (id, workflow, status, wake_at, lease_until, version, data, created_at, updated_at)
          VALUES (@id, @workflow, @status, @wakeAt, @leaseUntil, @version, @data, @createdAt, @updatedAt)`,
-      )
-      .run({
+    );
+    const insertTag = this.db.prepare(
+      `INSERT INTO ${this.tagTable} (tag, run_id, created_at) VALUES (?, ?, ?)`,
+    );
+    this.db.transaction(() => {
+      insertRun.run({
         id: run.id,
         workflow: run.workflow,
         status: run.status,
@@ -70,6 +97,8 @@ export class SqliteStore implements RunStore {
         createdAt: run.createdAt,
         updatedAt: run.updatedAt,
       });
+      for (const tag of run.tags ?? []) insertTag.run(tag, run.id, run.createdAt);
+    })();
   }
 
   async get(id: string): Promise<RunRecord | null> {
@@ -79,6 +108,7 @@ export class SqliteStore implements RunStore {
     return row ? this.hydrate(row) : null;
   }
 
+  /** The tag table is not written here: tags are fixed at create. See tags.ts. */
   async save(run: RunRecord, expectedVersion: number): Promise<boolean> {
     const next = expectedVersion + 1;
     const { changes } = this.db
@@ -133,29 +163,51 @@ export class SqliteStore implements RunStore {
    * Keyset pagination, the same row comparison as the Postgres store:
    * `(created_at, id) < (cursor)`, which the (created_at DESC, id DESC) index
    * answers directly and which stays exact while new runs are being created.
+   *
+   * And, as there, a tag is a second statement rather than another predicate:
+   * the tag index names the runs and their order, so the query reads the page
+   * it returns instead of walking runs newest-first and discarding the ones
+   * without the tag.
    */
   async list(query: RunQuery): Promise<RunPage> {
     const limit = pageLimit(query.limit);
     const cursor = query.cursor === undefined ? null : decodeCursor(query.cursor);
-    const rows = this.db
-      .prepare<
-        { workflow: string | null; status: string | null; createdAt: number | null; id: string | null; limit: number },
-        Row
-      >(
-        `SELECT data, status, wake_at, lease_until, version FROM ${this.table}
-          WHERE (@workflow IS NULL OR workflow = @workflow)
-            AND (@status IS NULL OR status = @status)
-            AND (@createdAt IS NULL OR (created_at, id) < (@createdAt, @id))
-          ORDER BY created_at DESC, id DESC
-          LIMIT @limit`,
-      )
-      .all({
-        workflow: query.workflow ?? null,
-        status: query.status ?? null,
-        createdAt: cursor?.createdAt ?? null,
-        id: cursor?.id ?? null,
-        limit: limit + 1,
-      });
+    const tag = queryTag(query.tag);
+    const filters = {
+      workflow: query.workflow ?? null,
+      status: query.status ?? null,
+      createdAt: cursor?.createdAt ?? null,
+      id: cursor?.id ?? null,
+      limit: limit + 1,
+    };
+    type Filters = typeof filters;
+    const rows =
+      tag === null
+        ? this.db
+            .prepare<Filters, Row>(
+              `SELECT data, status, wake_at, lease_until, version FROM ${this.table}
+                WHERE (@workflow IS NULL OR workflow = @workflow)
+                  AND (@status IS NULL OR status = @status)
+                  AND (@createdAt IS NULL OR (created_at, id) < (@createdAt, @id))
+                ORDER BY created_at DESC, id DESC
+                LIMIT @limit`,
+            )
+            .all(filters)
+        : this.db
+            .prepare<Filters & { tag: string }, Row>(
+              // The cursor is compared against the tag table's own columns,
+              // which is what keeps the whole page one range scan of its index.
+              `SELECT r.data, r.status, r.wake_at, r.lease_until, r.version
+                 FROM ${this.tagTable} t
+                 JOIN ${this.table} r ON r.id = t.run_id
+                WHERE t.tag = @tag
+                  AND (@workflow IS NULL OR r.workflow = @workflow)
+                  AND (@status IS NULL OR r.status = @status)
+                  AND (@createdAt IS NULL OR (t.created_at, t.run_id) < (@createdAt, @id))
+                ORDER BY t.created_at DESC, t.run_id DESC
+                LIMIT @limit`,
+            )
+            .all({ ...filters, tag });
     // One extra row tells us whether a next page exists without a second query.
     const runs = rows.slice(0, limit).map((row) => this.hydrate(row));
     const last = runs[runs.length - 1];

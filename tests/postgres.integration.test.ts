@@ -24,10 +24,10 @@ describe.skipIf(!url)("PostgresStore", () => {
     await store.ensureSchema();
   });
   beforeEach(async () => {
-    await pool.query("TRUNCATE workflow_runs_test");
+    await pool.query("TRUNCATE workflow_runs_test, workflow_runs_test_tags");
   });
   afterAll(async () => {
-    await pool.query("DROP TABLE IF EXISTS workflow_runs_test");
+    await pool.query("DROP TABLE IF EXISTS workflow_runs_test, workflow_runs_test_tags");
     await pool.end();
   });
 
@@ -112,6 +112,59 @@ describe.skipIf(!url)("PostgresStore", () => {
 
     expect((await engine.list({ status: "running" })).runs.map((r) => r.id)).toEqual(["r4", "r3", "r2", "r1"]);
     expect((await engine.list({ workflow: "nope" })).runs).toEqual([]);
+  });
+
+  it("finds tagged runs and pages a tag query with an exact cursor", async () => {
+    const engine = new Engine({ store, workflows: [wf], now: () => T0 });
+    for (const id of ["r1", "r2", "r3"]) await engine.start(wf, { n: 1 }, { id, tags: ["tenant:acme"] });
+    await engine.start(wf, { n: 1 }, { id: "r4", tags: ["tenant:other"] });
+
+    const first = await engine.list({ tag: "tenant:acme", limit: 2 });
+    expect(first.runs.map((r) => r.id)).toEqual(["r3", "r2"]);
+    const second = await engine.list({ tag: "tenant:acme", limit: 2, cursor: first.cursor ?? "" });
+    expect(second.runs.map((r) => r.id)).toEqual(["r1"]);
+    expect(second.cursor).toBeNull();
+    expect(first.runs[0]?.tags).toEqual(["tenant:acme"]);
+    expect((await engine.list({ tag: "tenant:nobody" })).runs).toEqual([]);
+  });
+
+  it("answers a tag query from the tag index, in order, without sorting", async () => {
+    const engine = new Engine({ store, workflows: [wf], now: () => T0 });
+    await engine.start(wf, { n: 1 }, { id: "r1", tags: ["order:1"] });
+
+    // The store's own statement, so this says something about the query that
+    // runs rather than about a copy of it kept in a test.
+    const query = pool.query.bind(pool);
+    let captured: { text: string; values: unknown[] } | null = null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    pool.query = (text: any, values?: any) => {
+      if (typeof text === "string" && text.includes("workflow_runs_test_tags")) captured = { text, values };
+      return query(text, values);
+    };
+    await engine.list({ tag: "order:1" });
+    pool.query = query;
+    expect(captured).not.toBeNull();
+
+    const client = await pool.connect();
+    try {
+      // A table this small is cheapest to read whole, so the planner is told to
+      // cost the alternatives out of the way. What is under test is that the
+      // index can answer the query at all — which it only can if it carries the
+      // tag and the listing order together.
+      await client.query("SET enable_seqscan = off");
+      await client.query("SET enable_bitmapscan = off");
+      const explained = await client.query(`EXPLAIN (COSTS OFF) ${captured!.text}`, captured!.values);
+      const plan = explained.rows.map((row: Record<string, string>) => row["QUERY PLAN"]).join("\n");
+
+      // An ordered scan of (tag, created_at DESC, run_id DESC) and no Sort: the
+      // tag narrows and the same index supplies the order, so the query reads
+      // the page it returns. An index on the tag alone would still appear here
+      // and would put a Sort above it.
+      expect(plan).toMatch(/Index Only Scan using workflow_runs_test_tags_recent/);
+      expect(plan).not.toMatch(/Sort/);
+    } finally {
+      client.release();
+    }
   });
 
   it("hydrates listed runs from the same columns as get()", async () => {

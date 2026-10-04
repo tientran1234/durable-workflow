@@ -17,6 +17,7 @@ import { DEFAULT_RETRY } from "./retry.js";
 import { compensatedError, runCompensations } from "./saga.js";
 import { type ScheduleOptions, type ScheduledRun, schedulePeriod, scheduleRunId } from "./schedule.js";
 import { type SignalDefinition, SignalRegistry, recordRejection, signalName } from "./signals.js";
+import { normalizeTags } from "./tags.js";
 import type { ChildHandle, RetryPolicy, RunPage, RunQuery, RunRecord, RunStore, WorkflowDefinition } from "./types.js";
 import { type RunView, renderRun } from "./view.js";
 import { WorkflowRegistry, runVersion } from "./versions.js";
@@ -107,6 +108,7 @@ export class Engine {
       input,
       parent: options.parent ?? null,
       ...(options.chain ? { chain: options.chain } : {}),
+      ...(options.tags?.length ? { tags: normalizeTags(options.tags) } : {}),
       status: "running",
       history: [],
       pendingSignals: options.pendingSignals ?? {},
@@ -158,7 +160,10 @@ export class Engine {
     return this.store.get(id);
   }
 
-  /** A page of runs, newest first. Pass the page's `cursor` back for the next one. */
+  /**
+   * A page of runs, newest first. Pass the page's `cursor` back for the next
+   * one, and `tag` to find the runs for one order, tenant or invoice.
+   */
   list(query: RunQuery = {}): Promise<RunPage> {
     return this.store.list(query);
   }
@@ -469,6 +474,10 @@ export class Engine {
         // it would make losing a signal a matter of which side of the handover
         // it landed on.
         pendingSignals: { ...run.pendingSignals },
+        // The chain is one piece of work under one set of names, so the tags
+        // follow it. An operator searching by order id wants the generation
+        // doing the work, not only the one they happened to start.
+        ...(run.tags ? { tags: run.tags } : {}),
       });
     }
     return id;

@@ -1,5 +1,6 @@
 import type { Pool } from "pg";
 import { decodeCursor, encodeCursor, pageLimit } from "../list.js";
+import { queryTag } from "../tags.js";
 import type { RunPage, RunQuery, RunRecord, RunStore } from "../types.js";
 
 interface Row {
@@ -15,15 +16,26 @@ const num = (v: string | number | null): number | null => (v === null ? null : N
 /**
  * Postgres-backed store. The full record lives in a JSONB column; the columns
  * a worker queries by (status, wake_at, lease_until, version) are mirrored so
- * claimDue is one indexed statement.
+ * claimDue is one indexed statement, and a run's tags are mirrored into a
+ * table beside it so a tag query is one indexed statement too.
  *
  * `pg` is an optional peer dependency — install it only if you use this store.
  */
 export class PostgresStore implements RunStore {
+  /**
+   * Where a run's tags are indexed: a row per (tag, run), carrying the run's
+   * `created_at` so the index can hand a tag's runs over already in listing
+   * order. Both columns are fixed when the run is created, so the copy cannot
+   * drift from the record.
+   */
+  private readonly tagTable: string;
+
   constructor(
     private readonly pool: Pool,
     private readonly table = "workflow_runs",
-  ) {}
+  ) {
+    this.tagTable = `${table}_tags`;
+  }
 
   /** Idempotent. Run once at startup or in a migration. */
   async ensureSchema(): Promise<void> {
@@ -45,13 +57,50 @@ export class PostgresStore implements RunStore {
     await this.pool.query(
       `CREATE INDEX IF NOT EXISTS ${this.table}_recent ON ${this.table} (created_at DESC, id DESC)`,
     );
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS ${this.tagTable} (
+        tag        TEXT NOT NULL,
+        run_id     TEXT NOT NULL,
+        created_at BIGINT NOT NULL,
+        PRIMARY KEY (tag, run_id)
+      )`);
+    // The tag first, then the listing order: one seek to the tag and the rows
+    // come out newest-first, so a tag query reads a page and stops. Indexing
+    // the tag alone would still leave the ordering to a sort over every run
+    // carrying it.
+    await this.pool.query(
+      `CREATE INDEX IF NOT EXISTS ${this.tagTable}_recent ON ${this.tagTable} (tag, created_at DESC, run_id DESC)`,
+    );
   }
 
+  /**
+   * The record and its index rows in one statement, so they are one
+   * transaction: a run that exists without its tags is a run an operator
+   * cannot find. A run with no tags unnests an empty array and inserts
+   * nothing, and a duplicate id still fails on the primary key below — which
+   * is what engine.schedule reads as "this period already started".
+   */
   async create(run: RunRecord): Promise<void> {
     await this.pool.query(
-      `INSERT INTO ${this.table} (id, workflow, status, wake_at, lease_until, version, data, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)`,
-      [run.id, run.workflow, run.status, run.wakeAt, run.leaseUntil, run.version, JSON.stringify(run), run.createdAt, run.updatedAt],
+      `WITH inserted AS (
+         INSERT INTO ${this.table} (id, workflow, status, wake_at, lease_until, version, data, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)
+         RETURNING id, created_at
+       )
+       INSERT INTO ${this.tagTable} (tag, run_id, created_at)
+       SELECT tag, inserted.id, inserted.created_at FROM inserted, unnest($10::text[]) AS tag`,
+      [
+        run.id,
+        run.workflow,
+        run.status,
+        run.wakeAt,
+        run.leaseUntil,
+        run.version,
+        JSON.stringify(run),
+        run.createdAt,
+        run.updatedAt,
+        run.tags ?? [],
+      ],
     );
   }
 
@@ -64,6 +113,7 @@ export class PostgresStore implements RunStore {
     return row ? this.hydrate(row) : null;
   }
 
+  /** The tag table is not written here: tags are fixed at create. See tags.ts. */
   async save(run: RunRecord, expectedVersion: number): Promise<boolean> {
     const next = expectedVersion + 1;
     const { rowCount } = await this.pool.query(
@@ -106,19 +156,50 @@ export class PostgresStore implements RunStore {
    * Keyset pagination: the cursor is compared as a row, `(created_at, id) <
    * (cursor)`, which the (created_at DESC, id DESC) index answers directly and
    * which stays exact while new runs are being created.
+   *
+   * A tag is a second statement rather than another predicate, because it is a
+   * different way into the table: the tag index names the runs and their
+   * order, so the query reads the page it returns. As a predicate on the
+   * statement below it would instead walk runs newest-first, discarding the
+   * ones without the tag, until it had collected a page — work proportional to
+   * the whole table for the one lookup tags exist to make cheap.
    */
   async list(query: RunQuery): Promise<RunPage> {
     const limit = pageLimit(query.limit);
     const cursor = query.cursor === undefined ? null : decodeCursor(query.cursor);
-    const { rows } = await this.pool.query<Row>(
-      `SELECT data, status, wake_at, lease_until, version FROM ${this.table}
-        WHERE ($1::text IS NULL OR workflow = $1)
-          AND ($2::text IS NULL OR status = $2)
-          AND ($3::bigint IS NULL OR (created_at, id) < ($3::bigint, $4::text))
-        ORDER BY created_at DESC, id DESC
-        LIMIT $5`,
-      [query.workflow ?? null, query.status ?? null, cursor?.createdAt ?? null, cursor?.id ?? null, limit + 1],
-    );
+    const tag = queryTag(query.tag);
+    const filters = [
+      query.workflow ?? null,
+      query.status ?? null,
+      cursor?.createdAt ?? null,
+      cursor?.id ?? null,
+      limit + 1,
+    ];
+    const { rows } =
+      tag === null
+        ? await this.pool.query<Row>(
+            `SELECT r.data, r.status, r.wake_at, r.lease_until, r.version FROM ${this.table} r
+              WHERE ($1::text IS NULL OR r.workflow = $1)
+                AND ($2::text IS NULL OR r.status = $2)
+                AND ($3::bigint IS NULL OR (r.created_at, r.id) < ($3::bigint, $4::text))
+              ORDER BY r.created_at DESC, r.id DESC
+              LIMIT $5`,
+            filters,
+          )
+        : await this.pool.query<Row>(
+            // The cursor is compared against the tag table's own columns, which
+            // is what keeps the whole page one range scan of its index.
+            `SELECT r.data, r.status, r.wake_at, r.lease_until, r.version
+               FROM ${this.tagTable} t
+               JOIN ${this.table} r ON r.id = t.run_id
+              WHERE t.tag = $6
+                AND ($1::text IS NULL OR r.workflow = $1)
+                AND ($2::text IS NULL OR r.status = $2)
+                AND ($3::bigint IS NULL OR (t.created_at, t.run_id) < ($3::bigint, $4::text))
+              ORDER BY t.created_at DESC, t.run_id DESC
+              LIMIT $5`,
+            [...filters, tag],
+          );
     // One extra row tells us whether a next page exists without a second query.
     const runs = rows.slice(0, limit).map((row) => this.hydrate(row));
     const last = runs[runs.length - 1];

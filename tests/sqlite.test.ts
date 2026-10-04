@@ -150,6 +150,60 @@ describe("SqliteStore", () => {
     expect((await engine.list({ workflow: "nope" })).runs).toEqual([]);
   });
 
+  it("finds a tagged run from another connection, and pages a tag query", async () => {
+    const engine = new Engine({ store, workflows: [wf], now: () => T0 });
+    for (const id of ["r1", "r2", "r3"]) await engine.start(wf, { n: 1 }, { id, tags: ["tenant:acme"] });
+    await engine.start(wf, { n: 1 }, { id: "r4", tags: ["tenant:other"] });
+
+    // A second connection, as the admin process that did not start the runs.
+    const other = connect();
+    try {
+      const reader = new Engine({ store: other.store, workflows: [wf], now: () => T0 });
+      const first = await reader.list({ tag: "tenant:acme", limit: 2 });
+      expect(first.runs.map((r) => r.id)).toEqual(["r3", "r2"]);
+      const second = await reader.list({ tag: "tenant:acme", limit: 2, cursor: first.cursor ?? "" });
+      expect(second.runs.map((r) => r.id)).toEqual(["r1"]);
+      expect(second.cursor).toBeNull();
+      expect((await reader.list({ tag: "tenant:acme" })).runs[0]?.tags).toEqual(["tenant:acme"]);
+    } finally {
+      other.db.close();
+    }
+  });
+
+  it("answers a tag query from the tag index, in order, without sorting", async () => {
+    const engine = new Engine({ store, workflows: [wf], now: () => T0 });
+    await engine.start(wf, { n: 1 }, { id: "r1", tags: ["order:1"] });
+
+    // The store's own statement, so this says something about the query that
+    // runs rather than about a copy of it kept in a test.
+    const prepare = db.prepare.bind(db);
+    let sql: string | null = null;
+    db.prepare = ((text: string) => {
+      if (text.includes("workflow_runs_tags")) sql = text;
+      return prepare(text);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    }) as any;
+    await engine.list({ tag: "order:1" });
+    db.prepare = prepare;
+    expect(sql).not.toBeNull();
+
+    const plan = (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all({
+      tag: "order:1",
+      workflow: null,
+      status: null,
+      createdAt: null,
+      id: null,
+      limit: 51,
+    }) as { detail: string }[]).map((p) => p.detail);
+
+    // A seek into (tag, created_at DESC, run_id DESC) and nothing else: the tag
+    // narrows and the same index supplies the order, so no temporary B-tree is
+    // built and no run outside the page is read. An index on the tag alone
+    // would still pass the first of these and fail the second.
+    expect(plan.join("\n")).toMatch(/SEARCH t USING COVERING INDEX workflow_runs_tags_recent \(tag=\?\)/);
+    expect(plan.join("\n")).not.toMatch(/TEMP B-TREE/);
+  });
+
   it("hydrates listed runs from the same columns as get()", async () => {
     const engine = new Engine({ store, workflows: [wf], now: () => T0 });
     const id = await engine.start(wf, { n: 21 });
