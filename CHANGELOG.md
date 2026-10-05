@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-05
+
+- Event-driven wakeups: Postgres `LISTEN/NOTIFY` on run changes so a worker wakes immediately on a signal or a due timer instead of waiting for the poll interval, and polling stays as the fallback — every write that leaves a run claimable notifies the listening workers and carries the run's wake time, which is what lets a worker be there for a timer nothing writes when it arrives, while a notification that is lost or missed still costs one poll interval and never a run.
+
 ## 2026-10-04
 
 - Tags and search: `engine.start(wf, input, { tags })` and `engine.list({ tag })`, indexed on both stores, so an operator finds the run for order X without knowing its id — the tag index carries the listing order too, so the query seeks once and reads the page it returns instead of walking every run newest-first to find the one that matters.

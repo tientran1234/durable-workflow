@@ -613,6 +613,73 @@ generation's history inspectable on its own.
 workflow that continues unconditionally is an infinite loop that survives
 restarts.
 
+## Event-driven wakeups
+
+A worker polls, and between two passes nothing is happening. A run created
+somewhere else — by a web request, by `engine.schedule`, by a parent's
+`ctx.startChild` — sits there until some worker's next pass, and so does a run
+whose timer or retry backoff has just come due. On average that is half the poll
+interval, and the way to shorten it is to poll harder, in every worker, against
+the same table.
+
+(`engine.signal` is the case that was never waiting: it executes the run it
+resumed in the calling process. It leaves the run for a worker only when another
+one holds the lease.)
+
+The Postgres store closes the rest of that gap by saying when a run becomes
+due. Every write that leaves a run claimable sends a `NOTIFY` carrying the run's
+id and its wake time, and a worker holds a session `LISTEN`ing for them:
+
+```ts
+const engine = new Engine({ store: new PostgresStore(pool), workflows });
+engine.worker({ pollMs: 30_000 });   // the interval is now the fallback, not the latency
+engine.worker({ pollMs: 500, events: false });   // or opt out and poll only
+```
+
+A worker reacts to two different things, and the second is why a wakeup carries
+a time rather than just an id:
+
+- **a run is due now** — it was just created, or a signal left it runnable for
+  somebody else to pick up. The write happens and the notification follows it;
+- **a run will be due at `wakeAt`** — it is asleep on a timer or a retry
+  backoff. Nothing writes the run when that moment arrives, so the notification
+  has to be the one that put it to sleep: the worker keeps the time and sets a
+  timer of its own for it.
+
+So a worker holds the wake times it has been told about, soonest first, and one
+timer for the earliest of them — `MAX_PENDING_WAKEUPS` of them at most, because
+a store may hold millions of sleeping runs and being on time for the next one is
+the point.
+
+**Polling stays, and stays load-bearing.** A notification is sent after the
+write it reports, in a separate statement, so a process that dies in between
+sends nothing. A lease that expires with the worker holding it announces nothing
+either — nothing writes the run. A worker that was not listening yet, or whose
+session had just dropped, hears nothing. In every one of those cases the run is
+claimed on the next pass, which is why the interval is a fallback and not an
+optimisation that can be removed: a wakeup is only ever a reason to look early.
+
+`watch` is the whole contract, and it is optional:
+
+```ts
+interface WakeupSource {
+  watch(onWake: (wake: { runId: string; wakeAt: number | null }) => void): Promise<WakeupSubscription>;
+}
+```
+
+`MemoryStore` and `SqliteStore` do not implement it and are polled; a worker
+checks for the method and does the right thing either way. A store that does
+implement it decides which runs are worth a wakeup with `wakeupFor`, so that
+what a notification means does not depend on which store sent it: not a terminal
+run, not one somebody already holds a lease on, and not a run `waiting` with no
+deadline — that one is waiting indefinitely rather than due now, and calling it
+due would have every worker claim it on every pass.
+
+A dropped `LISTEN` session is replaced behind the subscription. Notifications
+sent while it was gone are not redelivered — Postgres does not queue them for a
+session that is not there — which is the same gap as any other, and covered the
+same way.
+
 ## Design decisions
 
 **Retries are persisted wake times, not `setTimeout`.** A failed step records
@@ -640,6 +707,15 @@ that both try to advance the same run produce one winner and one
 LOCKED`, so *n* workers claim *n* disjoint batches in one statement each,
 without blocking one another.
 
+**A wakeup is a reason to look early, never the reason a run moves.** The
+Postgres store notifies listening workers when a run becomes claimable, but it
+does so after the write rather than inside it, and Postgres delivers nothing to
+a session that is not there. So every wakeup is allowed to be lost, and the
+poll interval — not the notification — is what guarantees the run is picked up.
+Making the notification reliable instead would mean a durable outbox beside the
+run, which is a second thing to write, drain and reason about for a result the
+poll already has.
+
 **Nondeterminism is an error, not a silent corruption.** If a deploy renames or
 reorders a step while runs are mid-flight, replay finds a history event whose
 name does not match the code and fails the run with `NondeterminismError`
@@ -660,11 +736,11 @@ the failure is left to escape.
 
 ## Stores
 
-| Store | For | Concurrency |
-|---|---|---|
-| `MemoryStore` | tests, scripts, single process | version check |
-| `SqliteStore` (`durable-workflow/sqlite`, needs `better-sqlite3`) | one node, and tests that want a real file | version check + one writer at a time |
-| `PostgresStore` (`durable-workflow/postgres`, needs `pg`) | production | version check + `FOR UPDATE SKIP LOCKED` |
+| Store | For | Concurrency | Wakeups |
+|---|---|---|---|
+| `MemoryStore` | tests, scripts, single process | version check | polled |
+| `SqliteStore` (`durable-workflow/sqlite`, needs `better-sqlite3`) | one node, and tests that want a real file | version check + one writer at a time | polled |
+| `PostgresStore` (`durable-workflow/postgres`, needs `pg`) | production | version check + `FOR UPDATE SKIP LOCKED` | `LISTEN`/`NOTIFY` |
 
 `SqliteStore` is the Postgres store's schema on a file: the record as JSON, the
 columns a worker queries by mirrored beside it.
@@ -689,7 +765,9 @@ Any `RunStore` implementation with `create / get / save(version) / claimDue /
 list` works. `save` must be conditional on `version`, `claimDue` must lease
 atomically, `list` must order by `(createdAt, id)` descending, and a
 `list({ tag })` must be answered from an index rather than by reading runs —
-that is the whole contract.
+that is the whole contract. A `watch` on top of it makes the store a
+`WakeupSource`; see **Event-driven wakeups** for what a worker does with one,
+and for why it is latency rather than part of the contract.
 
 ## Layout
 
@@ -704,6 +782,7 @@ src/
   versions.ts     the registry: definitions by name and version, and a run's pin
   list.ts         listing order and cursor codec, shared by engine and stores
   tags.ts         what a tag may be, and why a store indexes them at create
+  wakeups.ts      what a store may tell a worker, and the wait a wakeup cuts short
   compaction.ts   folding a settled history prefix into a snapshot replay indexes
   view.ts         a run rendered for an admin screen: blockedOn + history as a timeline
   children.ts     how a parent names its child and the signal the engine answers on
@@ -714,19 +793,21 @@ src/
   continuation.ts a chain's root, a run's generation, and the id the next one takes
   stores/memory.ts
   stores/sqlite.ts     the same record on a file: one writer, so claiming is one statement
-  stores/postgres.ts   JSONB record + mirrored query columns + SKIP LOCKED claim
+  stores/postgres.ts   JSONB record + mirrored query columns + SKIP LOCKED claim + LISTEN/NOTIFY
                        both keep a (tag, run) table beside the record, indexed in listing order
 tests/
-  engine.test.ts        100 tests with a hand-driven clock: memoisation, durable
+  engine.test.ts        115 tests with a hand-driven clock: memoisation, durable
                         backoff, early signals, timeouts, nondeterminism, leases,
                         listing, the run view, child runs, compaction, the
                         lifecycle hooks, scheduled starts, continuations,
-                        saga compensation, typed signals, step timeouts and tags
+                        saga compensation, typed signals, step timeouts, tags,
+                        and a worker reacting to wakeups a test sends by hand
   sqlite.test.ts        11 tests on a real file: a run resumed after the process
                         that started it is gone, stale writes, leases across two
                         connections, keyset paging, and the plan a tag query gets
   postgres.integration.test.ts   disjoint claims across concurrent workers, stale
-                        writes, keyset paging, and the plan a tag query gets
+                        writes, keyset paging, the plan a tag query gets, and
+                        the wakeups a run's life sends over LISTEN/NOTIFY
 ```
 
 ## Run
@@ -782,6 +863,14 @@ CI runs the full suite, Postgres included, on every push.
   wants. Threading cancellation through would mean a second signature for `fn`
   and a cooperating client on the other end of it; the client's own request
   timeout is that, where it exists.
+- **A wakeup for a lease that expired, and redelivery of one that was missed.**
+  A worker that dies holding a run writes nothing, so nothing announces that
+  the run is claimable again; the same is true of every notification sent while
+  a `LISTEN` session was down. Both are found by the next poll. Closing either
+  gap means something watching for leases that lapse, or an outbox the store
+  drains — a second source of truth about what is due, when the table already
+  answers that exactly.
+
 - **Durable hook delivery.** A lifecycle hook is an in-process call made after
   the write it reports; a worker that dies in between emits nothing, and nothing
   replays it. A side effect that must not be lost goes in the workflow as a step.
