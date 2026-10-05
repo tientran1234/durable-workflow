@@ -566,6 +566,19 @@ describe("event-driven wakeups", () => {
     }
   });
 
+  it("leaves the store unsubscribed when the worker is told to poll only", async () => {
+    const store = new WatchedStore();
+    const engine = new Engine({ store, workflows: [job] });
+    const handle = engine.worker({ pollMs: 5, events: false });
+    try {
+      const id = await engine.start(job, null);
+      await until(async () => (await engine.get(id))?.status === "completed");
+      expect(store.watchers).toEqual([]);
+    } finally {
+      await handle.stop();
+    }
+  });
+
   describe("what a store sends a wakeup for", () => {
     it("is a run nobody holds that is due now or at a time it can name", async () => {
       const waiter = defineWorkflow<null, void>("waiter", async (ctx) => {

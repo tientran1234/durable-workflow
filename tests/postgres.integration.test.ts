@@ -6,8 +6,9 @@
  *   pnpm db:up && DATABASE_URL=postgresql://postgres:postgres@localhost:5434/workflow pnpm test
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { Engine, defineWorkflow } from "../src/index.js";
-import { PostgresStore } from "../src/stores/postgres.js";
+import { Engine, type RunRecord, type Wakeup, defineWorkflow } from "../src/index.js";
+import { PostgresStore, WAKEUP_RECONNECT_MS } from "../src/stores/postgres.js";
+import { until } from "./helpers.js";
 
 const url = process.env.DATABASE_URL;
 
@@ -185,5 +186,116 @@ describe.skipIf(!url)("PostgresStore", () => {
     expect(await store.claimDue(T0 + 999, 30_000, 10)).toHaveLength(0);
     const due = await store.claimDue(T0 + 1_000, 30_000, 10);
     expect(due.map((r) => r.id)).toEqual([id]);
+  });
+
+  describe("event-driven wakeups", () => {
+    it("sends a wakeup for every run a worker could claim, and none for one it could not", async () => {
+      const wakes: Wakeup[] = [];
+      const subscription = await store.watch((wake) => wakes.push(wake));
+      try {
+        let now = T0;
+        const engine = new Engine({ store, workflows: [wf], now: () => now });
+
+        const id = await engine.start(wf, { n: 21 });
+        await until(() => wakes.length === 1);
+        await engine.settle(id); // asleep on its timer
+        await until(() => wakes.length === 2);
+        now += 1_000;
+        await engine.settle(id); // waiting for the signal, with a deadline
+        await until(() => wakes.length === 3);
+        expect((await engine.signal(id, "confirm", true)).status).toBe("completed");
+        await until(() => wakes.length === 4);
+
+        expect(wakes).toEqual([
+          { runId: id, wakeAt: null }, // created: running, so due now
+          { runId: id, wakeAt: T0 + 1_000 }, // the timer it is asleep on
+          { runId: id, wakeAt: T0 + 6_000 }, // the deadline on the wait
+          { runId: id, wakeAt: null }, // the signal made it due
+        ]);
+
+        // The run completed inside that last pass, and a terminal run is not
+        // one to claim. Ordering is what proves nothing was sent for it: a
+        // session is delivered its notifications in order, so the next wakeup
+        // to arrive being the new run's means none came between.
+        const other = await engine.start(wf, { n: 1 });
+        await until(() => wakes.length === 5);
+        expect(wakes[4]).toEqual({ runId: other, wakeAt: null });
+      } finally {
+        await subscription.close();
+      }
+    });
+
+    it("picks a new run up at once, on a worker whose poll interval it would wait out", async () => {
+      let passes = 0;
+      class Counted extends PostgresStore {
+        override async claimDue(now: number, leaseMs: number, limit: number): Promise<RunRecord[]> {
+          const claimed = await super.claimDue(now, leaseMs, limit);
+          passes++;
+          return claimed;
+        }
+      }
+      const counted = new Counted(pool, "workflow_runs_test");
+      const job = defineWorkflow<{ n: number }, number>("pg-job", async (ctx, input) =>
+        ctx.step("double", () => input.n * 2),
+      );
+      const engine = new Engine({ store: counted, workflows: [job] });
+
+      const handle = engine.worker({ pollMs: 60_000 });
+      try {
+        await until(() => passes >= 1); // nothing to do; the worker is waiting
+        const id = await engine.start(job, { n: 21 });
+
+        await until(async () => (await counted.get(id))?.status === "completed");
+        expect((await counted.get(id))?.output).toBe(42);
+      } finally {
+        await handle.stop();
+      }
+    });
+
+    it("is there for a timer because the write that set it said when", async () => {
+      const napper = defineWorkflow<null, string>("pg-napper", async (ctx) => {
+        await ctx.sleep("nap", 200);
+        return ctx.step("after", () => "awake");
+      });
+      const engine = new Engine({ store, workflows: [napper] });
+      const id = await engine.start(napper, null);
+
+      // Nothing writes the run when the timer arrives, so the only thing that
+      // can bring the worker back inside its poll interval is the wake time it
+      // was told when the run went to sleep.
+      const handle = engine.worker({ pollMs: 60_000 });
+      try {
+        await until(async () => (await store.get(id))?.status === "completed", 3_000);
+        expect((await store.get(id))?.output).toBe("awake");
+      } finally {
+        await handle.stop();
+      }
+    });
+
+    it("replaces a listening session the server dropped", async () => {
+      const wakes: Wakeup[] = [];
+      const subscription = await store.watch((wake) => wakes.push(wake));
+      try {
+        const engine = new Engine({ store, workflows: [wf], now: () => T0 });
+        await engine.start(wf, { n: 1 }, { id: "before" });
+        await until(() => wakes.length === 1);
+
+        // The way a failover or an idle-connection reaper ends it.
+        await pool.query(
+          `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+            WHERE query LIKE 'LISTEN%' AND pid <> pg_backend_pid()`,
+        );
+
+        // Whatever is sent while it is down is lost, which is what the poll
+        // interval is for — so wait the reconnect out before sending one that
+        // has somewhere to land.
+        await new Promise<void>((resolve) => setTimeout(resolve, WAKEUP_RECONNECT_MS + 250));
+        await engine.start(wf, { n: 1 }, { id: "after" });
+
+        await until(() => wakes.some((wake) => wake.runId === "after"));
+      } finally {
+        await subscription.close();
+      }
+    });
   });
 });

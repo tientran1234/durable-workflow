@@ -1,7 +1,8 @@
-import type { Pool } from "pg";
+import type { Notification, Pool } from "pg";
 import { decodeCursor, encodeCursor, pageLimit } from "../list.js";
 import { queryTag } from "../tags.js";
 import type { RunPage, RunQuery, RunRecord, RunStore } from "../types.js";
+import { type Wakeup, type WakeupSource, type WakeupSubscription, decodeWakeup, encodeWakeup, wakeupFor } from "../wakeups.js";
 
 interface Row {
   data: RunRecord;
@@ -14,14 +15,28 @@ interface Row {
 const num = (v: string | number | null): number | null => (v === null ? null : Number(v));
 
 /**
+ * How long a dropped LISTEN connection is left before it is replaced. Short,
+ * because the gap is a gap in wakeups and nothing more: polling moves every
+ * run throughout it.
+ */
+export const WAKEUP_RECONNECT_MS = 1_000;
+
+/** The channel as LISTEN must spell it, so it matches the name pg_notify is given. */
+const quoted = (channel: string): string => `"${channel.replace(/"/g, '""')}"`;
+
+/**
  * Postgres-backed store. The full record lives in a JSONB column; the columns
  * a worker queries by (status, wake_at, lease_until, version) are mirrored so
  * claimDue is one indexed statement, and a run's tags are mirrored into a
  * table beside it so a tag query is one indexed statement too.
  *
+ * It is also the one store that can tell a worker a run became due instead of
+ * waiting to be asked: every write that leaves a run claimable sends a
+ * NOTIFY, and `watch` is a session LISTENing for them.
+ *
  * `pg` is an optional peer dependency — install it only if you use this store.
  */
-export class PostgresStore implements RunStore {
+export class PostgresStore implements RunStore, WakeupSource {
   /**
    * Where a run's tags are indexed: a row per (tag, run), carrying the run's
    * `created_at` so the index can hand a tag's runs over already in listing
@@ -29,12 +44,15 @@ export class PostgresStore implements RunStore {
    * drift from the record.
    */
   private readonly tagTable: string;
+  /** Where wakeups for this table are sent. Named after it, so two tables do not share them. */
+  private readonly channel: string;
 
   constructor(
     private readonly pool: Pool,
     private readonly table = "workflow_runs",
   ) {
     this.tagTable = `${table}_tags`;
+    this.channel = `${table}_wake`;
   }
 
   /** Idempotent. Run once at startup or in a migration. */
@@ -102,6 +120,7 @@ export class PostgresStore implements RunStore {
         run.tags ?? [],
       ],
     );
+    await this.wake(run);
   }
 
   async get(id: string): Promise<RunRecord | null> {
@@ -124,6 +143,7 @@ export class PostgresStore implements RunStore {
     );
     if (rowCount !== 1) return false;
     run.version = next;
+    await this.wake(run);
     return true;
   }
 
@@ -204,6 +224,104 @@ export class PostgresStore implements RunStore {
     const runs = rows.slice(0, limit).map((row) => this.hydrate(row));
     const last = runs[runs.length - 1];
     return { runs, cursor: rows.length > limit && last ? encodeCursor(last) : null };
+  }
+
+  /**
+   * Listen for this table's wakeups on a connection of its own — a
+   * notification is delivered to the session that subscribed, so this is the
+   * one thing in the store that cannot be a pooled round trip.
+   *
+   * The first connection is awaited, so a worker starting against a database
+   * it cannot LISTEN on says so. Losing it later is handled here instead: the
+   * session is replaced after WAKEUP_RECONNECT_MS, and whatever was sent while
+   * it was gone is simply not delivered, which is the gap polling covers.
+   */
+  async watch(onWake: (wake: Wakeup) => void): Promise<WakeupSubscription> {
+    let current: { release: () => void } | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let closed = false;
+
+    const lost = (): void => {
+      current = null;
+      if (closed) return;
+      timer = setTimeout(() => {
+        // Another failure lands back here, so this retries for as long as the
+        // subscription is open: giving up would be a worker that polls
+        // forever, which nothing would ever say.
+        void this.listen(onWake, lost).then((next) => {
+          if (closed) next.release();
+          else current = next;
+        }, lost);
+      }, WAKEUP_RECONNECT_MS);
+      timer.unref();
+    };
+
+    try {
+      current = await this.listen(onWake, lost);
+    } catch (err) {
+      closed = true;
+      throw err;
+    }
+
+    return {
+      close: async () => {
+        closed = true;
+        if (timer !== null) clearTimeout(timer);
+        const held = current;
+        current = null;
+        held?.release();
+      },
+    };
+  }
+
+  /**
+   * Tell whoever is listening that this run is theirs to claim, if it is.
+   *
+   * Sent after the write it reports rather than inside it, so a process that
+   * dies in between sends nothing — a wakeup lost, not a run lost. That is the
+   * whole reason a worker keeps polling, and it is why this is one more round
+   * trip on the writes that leave a run claimable rather than a condition
+   * folded into each statement, where it would have to be read back out of the
+   * row count that already answers something else.
+   */
+  private async wake(run: RunRecord): Promise<void> {
+    const wakeup = wakeupFor(run);
+    if (wakeup === null) return;
+    await this.pool.query("SELECT pg_notify($1, $2)", [this.channel, encodeWakeup(wakeup)]);
+  }
+
+  /** One LISTENing session, with the handlers that give it up when it breaks. */
+  private async listen(onWake: (wake: Wakeup) => void, lost: () => void): Promise<{ release: () => void }> {
+    const client = await this.pool.connect();
+    let held = true;
+    // Always given back as broken, even on a clean close: the session carries
+    // a LISTEN and these handlers, and neither of them survives being handed
+    // to the next caller as a fresh connection.
+    const give = (): boolean => {
+      if (!held) return false;
+      held = false;
+      client.release(true);
+      return true;
+    };
+    const drop = (): void => {
+      if (give()) lost();
+    };
+
+    client.on("error", drop);
+    client.on("end", drop);
+    client.on("notification", (message: Notification) => {
+      if (message.channel !== this.channel) return;
+      const wake = decodeWakeup(message.payload);
+      if (wake !== null) onWake(wake);
+    });
+
+    try {
+      await client.query(`LISTEN ${quoted(this.channel)}`);
+    } catch (err) {
+      give();
+      throw err;
+    }
+    return { release: give };
   }
 
   private hydrate(row: Row): RunRecord {

@@ -21,6 +21,7 @@ import { normalizeTags } from "./tags.js";
 import type { ChildHandle, RetryPolicy, RunPage, RunQuery, RunRecord, RunStore, WorkflowDefinition } from "./types.js";
 import { type RunView, renderRun } from "./view.js";
 import { WorkflowRegistry, runVersion } from "./versions.js";
+import { WorkerWait, isWakeupSource } from "./wakeups.js";
 
 export interface EngineOptions {
   store: RunStore;
@@ -294,24 +295,41 @@ export class Engine {
     return executed;
   }
 
-  /** Poll for due runs until stopped. Safe to run in several processes at once. */
-  worker(options: { pollMs?: number; batch?: number } = {}): WorkerHandle {
+  /**
+   * Poll for due runs until stopped. Safe to run in several processes at once.
+   *
+   * Where the store offers wakeups, the worker subscribes to them and `pollMs`
+   * becomes the fallback rather than the latency of a run that became due
+   * elsewhere: the write that leaves a run claimable reaches every listening
+   * worker at once, and a wake time it is told in advance is one it can be
+   * there for. Pass `events: false` to poll and nothing else.
+   */
+  worker(options: { pollMs?: number; batch?: number; events?: boolean } = {}): WorkerHandle {
     const pollMs = options.pollMs ?? 500;
     const batch = options.batch ?? 10;
+    const wait = new WorkerWait(this.now);
+    const source = options.events === false || !isWakeupSource(this.store) ? null : this.store;
     let running = true;
 
     const loop = (async () => {
-      while (running) {
-        const n = await this.processDue(batch);
-        if (n === 0 && running) {
-          await new Promise<void>((resolve) => setTimeout(resolve, pollMs).unref());
+      // Subscribed before the first pass, so nothing written between the two
+      // has to wait for a poll. A store that cannot be subscribed to at all
+      // raises here, where a worker starting up still has someone to tell.
+      const watching = source === null ? null : await source.watch((wake) => wait.push(wake));
+      try {
+        while (running) {
+          const n = await this.processDue(batch);
+          if (n === 0 && running) await wait.wait(pollMs);
         }
+      } finally {
+        await watching?.close();
       }
     })();
 
     return {
       stop: async () => {
         running = false;
+        wait.close();
         await loop;
       },
     };
