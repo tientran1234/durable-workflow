@@ -3,9 +3,11 @@ import {
   ChildFailedError,
   type ChildHandle,
   ConflictError,
+  Engine,
   MAX_REJECTED_SIGNALS,
   MAX_TAGS,
   MAX_TAG_LENGTH,
+  MemoryStore,
   NondeterminismError,
   type RunCompletedEvent,
   type RunFailedEvent,
@@ -16,13 +18,17 @@ import {
   type StepFailedEvent,
   StepTimeoutError,
   WaitTimeoutError,
+  type Wakeup,
+  type WakeupSource,
+  type WakeupSubscription,
   defineSignal,
   defineWorkflow,
   historyEvents,
   schedulePeriod,
   scheduleRunId,
+  wakeupFor,
 } from "../src/index.js";
-import { harness, T0 } from "./helpers.js";
+import { T0, harness, until } from "./helpers.js";
 
 describe("steps", () => {
   it("runs steps in order and completes with the returned output", async () => {
@@ -443,6 +449,154 @@ describe("worker", () => {
     await new Promise((r) => setTimeout(r, 30));
     await handle.stop();
     expect((await engine.get(id))?.output).toBe(42);
+  });
+});
+
+describe("event-driven wakeups", () => {
+  const job = defineWorkflow<null, number>("job", async (ctx) => ctx.step("work", () => 42));
+
+  /**
+   * A store with wakeups the test sends by hand: MemoryStore plus the one
+   * method `worker()` looks for, and a count of the passes it has answered so
+   * a test can tell a worker that is waiting from one that has not started.
+   */
+  class WatchedStore extends MemoryStore implements WakeupSource {
+    readonly watchers: ((wake: Wakeup) => void)[] = [];
+    passes = 0;
+    closed = 0;
+    /** Run after a pass has been answered, to write behind a worker's back. */
+    afterClaim: (() => Promise<void>) | undefined;
+
+    async watch(onWake: (wake: Wakeup) => void): Promise<WakeupSubscription> {
+      this.watchers.push(onWake);
+      return {
+        close: async () => {
+          this.closed++;
+        },
+      };
+    }
+
+    override async claimDue(now: number, leaseMs: number, limit: number): Promise<RunRecord[]> {
+      const claimed = await super.claimDue(now, leaseMs, limit);
+      this.passes++;
+      await this.afterClaim?.();
+      return claimed;
+    }
+
+    push(wake: Wakeup): void {
+      for (const onWake of this.watchers) onWake(wake);
+    }
+  }
+
+  it("wakes on a wakeup instead of waiting the poll interval out", async () => {
+    const store = new WatchedStore();
+    const engine = new Engine({ store, workflows: [job] });
+    const handle = engine.worker({ pollMs: 60_000 });
+    try {
+      await until(() => store.passes >= 1); // nothing to do; the worker is waiting
+      const id = await engine.start(job, null);
+      store.push({ runId: id, wakeAt: null });
+
+      await until(async () => (await engine.get(id))?.status === "completed");
+      expect((await engine.get(id))?.output).toBe(42);
+    } finally {
+      await handle.stop();
+    }
+    expect(store.closed).toBe(1); // the subscription is the worker's, and ends with it
+  });
+
+  it("wakes at a wake time it was told in advance, which nothing writes when it arrives", async () => {
+    const napper = defineWorkflow<null, string>("napper", async (ctx) => {
+      await ctx.sleep("nap", 150);
+      return ctx.step("after", () => "awake");
+    });
+    const store = new WatchedStore();
+    const engine = new Engine({ store, workflows: [napper] });
+    const id = await engine.start(napper, null);
+    await engine.settle(id);
+    const sleeping = await engine.get(id);
+    expect(sleeping?.status).toBe("sleeping");
+
+    // The worker is handed the wake time and nothing else. No write happens
+    // when it arrives, so a worker that only reacts to wakeups sent in the
+    // moment would sit here for the whole poll interval.
+    const handle = engine.worker({ pollMs: 60_000 });
+    try {
+      await until(() => store.passes >= 1);
+      store.push({ runId: id, wakeAt: sleeping?.wakeAt ?? null });
+
+      await until(async () => (await engine.get(id))?.status === "completed");
+      expect((await engine.get(id))?.output).toBe("awake");
+    } finally {
+      await handle.stop();
+    }
+  });
+
+  it("keeps a wakeup that arrives while a pass is already running", async () => {
+    const store = new WatchedStore();
+    const engine = new Engine({ store, workflows: [job] });
+    let id = "";
+    // Written after the pass has already claimed, so this pass misses it and
+    // the wakeup lands on a worker that is not yet waiting for one.
+    store.afterClaim = async () => {
+      store.afterClaim = undefined;
+      id = await engine.start(job, null);
+      store.push({ runId: id, wakeAt: null });
+    };
+
+    const handle = engine.worker({ pollMs: 60_000 });
+    try {
+      await until(async () => id !== "" && (await engine.get(id))?.status === "completed");
+    } finally {
+      await handle.stop();
+    }
+  });
+
+  it("still moves a run on the poll interval when no wakeup arrives", async () => {
+    const store = new WatchedStore();
+    const engine = new Engine({ store, workflows: [job] });
+    const handle = engine.worker({ pollMs: 5 });
+    try {
+      await until(() => store.passes >= 1);
+      const id = await engine.start(job, null); // and nothing is pushed
+
+      await until(async () => (await engine.get(id))?.status === "completed");
+    } finally {
+      await handle.stop();
+    }
+  });
+
+  describe("what a store sends a wakeup for", () => {
+    it("is a run nobody holds that is due now or at a time it can name", async () => {
+      const waiter = defineWorkflow<null, void>("waiter", async (ctx) => {
+        await ctx.waitFor("go");
+      });
+      const { engine, store } = harness([waiter]);
+      const id = await engine.start(waiter, null);
+
+      const fresh = (await store.get(id))!;
+      expect(wakeupFor(fresh)).toEqual({ runId: id, wakeAt: null });
+      expect(wakeupFor({ ...fresh, leaseUntil: T0 + 30_000 })).toBeNull();
+      expect(wakeupFor({ ...fresh, status: "completed" })).toBeNull();
+
+      // Waiting with no deadline: there is no time to name, and calling that
+      // "due now" would have every worker claim it on every pass.
+      await engine.settle(id);
+      const waiting = (await store.get(id))!;
+      expect(waiting.status).toBe("waiting");
+      expect(wakeupFor(waiting)).toBeNull();
+    });
+
+    it("names the wake time of a run that is asleep on a timer", async () => {
+      const napper = defineWorkflow<null, void>("napper", async (ctx) => {
+        await ctx.sleep("nap", 1_000);
+      });
+      const { engine, store } = harness([napper]);
+      const id = await engine.start(napper, null);
+      await engine.settle(id);
+
+      expect(wakeupFor((await store.get(id))!)).toEqual({ runId: id, wakeAt: T0 + 1_000 });
+    });
   });
 });
 

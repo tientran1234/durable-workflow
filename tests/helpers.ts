@@ -44,3 +44,17 @@ export function harness(
     },
   };
 }
+
+/**
+ * Wait for something a worker's own timing decides, or fail. The timeout is
+ * short and deliberate: a test that hands a worker a long poll interval and
+ * then waits on a wakeup is asserting that the wakeup arrived, so it should
+ * fail saying so rather than sit until the runner gives up.
+ */
+export async function until(ok: () => boolean | Promise<boolean>, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await ok())) {
+    if (Date.now() > deadline) throw new Error(`still waiting after ${timeoutMs}ms`);
+    await new Promise<void>((resolve) => setTimeout(resolve, 2));
+  }
+}

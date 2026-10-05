@@ -47,6 +47,10 @@ export type { ScheduleOptions, ScheduledRun } from "./schedule.js";
 export { MAX_REJECTED_SIGNALS, defineSignal, signalName } from "./signals.js";
 export type { SignalDefinition, SignalSchema } from "./signals.js";
 
+// Event-driven wakeups: what a store may tell a worker instead of being polled.
+export { MAX_PENDING_WAKEUPS, WorkerWait, decodeWakeup, encodeWakeup, isWakeupSource, wakeupFor } from "./wakeups.js";
+export type { Wakeup, WakeupSource, WakeupSubscription } from "./wakeups.js";
+
 // Tags: the application's names for a run, and what a store must index them as.
 export { MAX_TAGS, MAX_TAG_LENGTH, hasTag, normalizeTags, queryTag } from "./tags.js";
 
