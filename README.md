@@ -463,6 +463,59 @@ find. Duplicates collapse, and whitespace around a tag is trimmed both
 where it is stored and where it is matched, so `" order:1 "` and `"order:1"`
 are the same tag.
 
+## Dashboard
+
+`engine.view` is JSON. `engine.dashboard()` is the screen over it, as one
+fetch handler:
+
+```ts
+const admin = engine.dashboard({ title: "Acme ops" });
+
+Bun.serve({ fetch: admin });                                  // or Deno.serve, or a Worker
+app.all("/ops/workflows/*", (c) => admin(c.req.raw));         // or a route in whatever you have
+```
+
+What it serves is three screens and one action: the run list, filtered by
+workflow, status and tag and paged by the same cursor `engine.list` returns;
+one run, with its facts, its input and output, and its history as the timeline
+`engine.view` renders; and a form that sends a signal to the run you are
+looking at, pre-filled with the name it is waiting for.
+
+Each response is one self-contained HTML document — styles inline, no scripts,
+no assets to host, every action a link or a form. There is nothing to build and
+nothing to serve beside it, which is the point: a dashboard you have to deploy
+is a dashboard nobody has during the incident.
+
+It never has to be told where it is mounted. Routing is entirely in the query
+string — `?run=<id>` is one run, no query is the list, a POST sends a signal —
+so the links it writes are relative to the path the request arrived on, and the
+same handler works at `/ops/workflows`, at the root, or behind a proxy that
+rewrites neither.
+
+The payload box is read as JSON, and an empty one as `null` — the untyped
+signal whose arrival is the whole message. Anything that is not JSON comes back
+as a message on the form rather than reaching the engine as the string somebody
+typed, because a schema is waiting on a shape and would refuse it somewhere the
+operator cannot see. A schema that does refuse a payload says so on the form
+too, and the run page lists every refusal `engine.view` kept — which is the
+only place a run still waiting for a signal somebody insists they sent explains
+itself.
+
+```ts
+// What the dashboard asks of an engine, and all it can do with one.
+export interface DashboardEngine {
+  list(query: RunQuery): Promise<RunPage>;
+  view(id: string): Promise<RunView | null>;
+  signal(id: string, name: string, payload?: unknown): Promise<RunRecord>;
+}
+```
+
+It takes that interface rather than an `Engine`, so the screen can only do what
+an operator should: there is no `cancel` on it and no store behind it. Mount it
+on a path your admin surface already authenticates — **it authenticates nobody
+itself**, it reads every run's input and output, and it can resume a run. See
+below for why the CSRF token is that layer's too.
+
 ## Hooks
 
 `engine.list` and `engine.view` answer a question when you ask it. Hooks are the
@@ -785,6 +838,7 @@ src/
   wakeups.ts      what a store may tell a worker, and the wait a wakeup cuts short
   compaction.ts   folding a settled history prefix into a snapshot replay indexes
   view.ts         a run rendered for an admin screen: blockedOn + history as a timeline
+  dashboard.ts    that view as HTML: one fetch handler, routed by query string
   children.ts     how a parent names its child and the signal the engine answers on
   saga.ts         the undos a failing run owes, newest first, and how it reports them
   signals.ts      a signal's name and schema in one value, and the refusals a run keeps
@@ -802,6 +856,10 @@ tests/
                         lifecycle hooks, scheduled starts, continuations,
                         saga compensation, typed signals, step timeouts, tags,
                         and a worker reacting to wakeups a test sends by hand
+  dashboard.test.ts     16 tests driving the handler the way a browser does:
+                        follow the link the list writes, read the timeline, post
+                        the form, follow the redirect — and a `<script>` tag
+                        carried in through an id, a tag, an input and the query
   sqlite.test.ts        11 tests on a real file: a run resumed after the process
                         that started it is gone, stale writes, leases across two
                         connections, keyset paging, and the plan a tag query gets
@@ -863,6 +921,23 @@ CI runs the full suite, Postgres included, on every push.
   wants. Threading cancellation through would mean a second signature for `fn`
   and a cooperating client on the other end of it; the client's own request
   timeout is that, where it exists.
+- **Authentication, and the CSRF token that goes with it.** `engine.dashboard()`
+  serves whoever reaches it, and a cross-site form can post to it. Both belong
+  to the layer you mount it behind: a token has to be bound to a session, and
+  the session is the one thing a handler with no user model cannot have. The
+  consequence is a rule rather than a setting — do not route to it from the
+  public internet.
+- **Cancelling, retrying or editing a run from the dashboard.** The screen can
+  send a signal and nothing else. A signal is a message the workflow already
+  asked for and handles on a path it defines; a cancel button is an operator
+  ending a run from outside its own logic, and a retry button is an operator
+  deciding a step's policy was wrong after the fact. Both are `Engine` calls
+  with consequences worth writing down at the call site, which is why the
+  dashboard takes `DashboardEngine` and not an engine.
+- **A dashboard that updates itself.** Each response is a document, so a run
+  moving on is a refresh. Live state means a socket or a poll loop, which means
+  scripts, which means the one thing this is not: something to build and host
+  before it is any use.
 - **A wakeup for a lease that expired, and redelivery of one that was missed.**
   A worker that dies holding a run writes nothing, so nothing announces that
   the run is claimable again; the same is true of every notification sent while

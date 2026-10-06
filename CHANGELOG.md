@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-06
+
+- Dashboard: `engine.dashboard()` returns a single-file HTML handler (fetch-compatible) listing runs, rendering the timeline from `engine.view` and offering a form to send a signal — self-contained HTML with no scripts and no assets to host, routed entirely through the query string so it works mounted on any path, because a dashboard you have to build and deploy is one nobody has during the incident.
+
 ## 2026-10-05
 
 - Event-driven wakeups: Postgres `LISTEN/NOTIFY` on run changes so a worker wakes immediately on a signal or a due timer instead of waiting for the poll interval, and polling stays as the fallback — every write that leaves a run claimable notifies the listening workers and carries the run's wake time, which is what lets a worker be there for a timer nothing writes when it arrives, while a notification that is lost or missed still costs one poll interval and never a run.
