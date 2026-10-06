@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { childOutcome } from "./children.js";
 import { DEFAULT_COMPACT_AFTER, compactHistory } from "./compaction.js";
 import { type ReplayContext, appendEvent, createContext } from "./context.js";
+import { type DashboardHandler, type DashboardOptions, dashboard } from "./dashboard.js";
 import { chainRoot, continuationRunId, runGeneration } from "./continuation.js";
 import { TERMINAL, isDue } from "./due.js";
 import {
@@ -173,6 +174,17 @@ export class Engine {
   async view(id: string): Promise<RunView | null> {
     const run = await this.store.get(id);
     return run ? renderRun(run) : null;
+  }
+
+  /**
+   * That admin screen, rendered: a `Request` to `Response` handler serving the
+   * run list, one run's timeline and a form to signal it, as self-contained
+   * HTML. Mount it on whatever path your admin surface already authenticates —
+   * it reads every run's input and output and can resume one, and it does not
+   * authenticate anybody itself.
+   */
+  dashboard(options: DashboardOptions = {}): DashboardHandler {
+    return dashboard(this, options);
   }
 
   /** One execution pass, if the run is due and unleased. Returns the run as persisted afterwards. */

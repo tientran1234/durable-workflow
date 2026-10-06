@@ -57,6 +57,10 @@ export { MAX_TAGS, MAX_TAG_LENGTH, hasTag, normalizeTags, queryTag } from "./tag
 export { renderRun } from "./view.js";
 export type { RunBlockedOn, RunView, TimelineEntry } from "./view.js";
 
+// The admin screen over that view: one fetch handler, self-contained HTML.
+export { DASHBOARD_LIMIT, dashboard } from "./dashboard.js";
+export type { DashboardEngine, DashboardHandler, DashboardOptions } from "./dashboard.js";
+
 // For re-delivering a child's outcome by hand: the signal its parent waits on.
 export { childSignal } from "./children.js";
 
