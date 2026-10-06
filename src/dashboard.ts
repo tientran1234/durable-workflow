@@ -282,7 +282,7 @@ function signalForm(view: RunView, url: URL): string {
   }
   const waiting = view.blockedOn?.kind === "signal" ? view.blockedOn.name : "";
   return `<h2>Send a signal</h2>
-    <form method="post" action="${text(link(url))}">
+    <form class="signal" method="post" action="${text(link(url))}">
       <input type="hidden" name="run" value="${text(view.id)}" />
       <label>name <input type="text" name="signal" value="${text(waiting)}" placeholder="manual-review" required /></label>
       <label>payload <textarea name="payload" rows="4" placeholder="JSON, or leave empty for null"></textarea></label>
@@ -446,8 +446,8 @@ dd { margin: 0; }
 .badge.waiting, .badge.sleeping { color: #b45309; border-color: #b4530955; }
 .tag { display: inline-block; padding: .05rem .4rem; border-radius: 4px; font-size: .75rem;
   border: 1px solid var(--line); }
-.filters, form[method="post"] { display: flex; flex-wrap: wrap; gap: .5rem; align-items: flex-end; margin: 0 0 1.5rem; }
-form[method="post"] { flex-direction: column; align-items: stretch; max-width: 32rem; }
+.filters, .signal { display: flex; flex-wrap: wrap; gap: .5rem; align-items: flex-end; margin: 0 0 1.5rem; }
+.signal { flex-direction: column; align-items: stretch; max-width: 32rem; }
 label { display: flex; flex-direction: column; gap: .25rem; color: var(--dim); font-size: .8rem; }
 input, select, textarea, button { font: inherit; padding: .35rem .5rem; border-radius: 6px;
   border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
