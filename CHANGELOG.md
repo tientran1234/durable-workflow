@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-07
+
+- A view over a whole continuation chain: `engine.viewChain(id)` answers from any id in the chain, with every generation's view and their timelines on one axis — the walk follows the recorded handovers from the root the named run carries, the same one `signal` and `cancel` take to reach the live generation, so an id from six generations ago reads the work rather than the record it names, and offsets run from the root because a per-run offset restarts at zero at every handover.
+
 ## 2026-10-06
 
 - Dashboard: `engine.dashboard()` returns a single-file HTML handler (fetch-compatible) listing runs, rendering the timeline from `engine.view` and offering a form to send a signal — self-contained HTML with no scripts and no assets to host, routed entirely through the query string so it works mounted on any path, because a dashboard you have to build and deploy is one nobody has during the incident.

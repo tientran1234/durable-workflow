@@ -657,9 +657,41 @@ and `settle` walk to the generation that is running, so an admin screen or a
 child holding an id from six generations ago still addresses the work rather
 than a run that is done. Signals the predecessor had buffered and never
 consumed move over too: whether a signal survives should not depend on which
-side of a handover it landed on. Reading stays per-run — `get`, `view` and
-`list` answer about the record you asked for, which is what makes each
-generation's history inspectable on its own.
+side of a handover it landed on. `get`, `view` and `list` still answer about
+the record you asked for, which is what makes each generation's history
+inspectable on its own; `engine.viewChain` below is the same chain read the way
+`signal` addresses it.
+
+```ts
+const chain = await engine.viewChain("run-1");      // or "run-1~3"; either answers
+// {
+//   root: "run-1", live: "run-1~3", generations: 3, status: "sleeping",
+//   input: { cursor: null, swept: 0 },              // what the chain was asked to do
+//   output: undefined, durationMs: 121_400,
+//   blockedOn: { kind: "timer", name: "breathe", until: 1800000181400 },
+//   runs: [ /* each generation as engine.view renders it, oldest first */ ],
+//   timeline: [
+//     { generation: 1, runId: "run-1",   elapsedMs: 0,       summary: 'step "page" completed' },
+//     { generation: 1, runId: "run-1",   elapsedMs: 400,     summary: 'step "archive" completed' },
+//     { generation: 1, runId: "run-1",   elapsedMs: 60_400,  summary: 'timer "breathe" fired' },
+//     { generation: 2, runId: "run-1~2", elapsedMs: 60_700,  summary: 'step "page" completed' },
+//     // …
+//   ],
+// }
+```
+
+The chain is found from the root the run names, not from the id you passed, so
+an id from six generations ago reads the same as the live one — asking about the
+work rather than about a record is the whole difference from `view`. The fields a
+chain shares with a run answer about the chain: the root's input, the outcome the
+last generation reported, elapsed time across every handover. Offsets on that
+timeline are from the root for the same reason, since a per-run offset restarts
+at zero at each handover; each generation's own view keeps its own.
+
+A handover leaves no history event — nothing replays it — so the only thing that
+marks one on the timeline is `generation` changing. Reading a chain costs one
+store read per generation, the same walk `signal` already does; a chain long
+enough for that to matter is one to page over with `list({ tag })` instead.
 
 **When to stop is the workflow's business.** Nothing here caps a chain; the
 `if` that returns instead of continuing is the only thing that ends one. A
@@ -837,7 +869,8 @@ src/
   tags.ts         what a tag may be, and why a store indexes them at create
   wakeups.ts      what a store may tell a worker, and the wait a wakeup cuts short
   compaction.ts   folding a settled history prefix into a snapshot replay indexes
-  view.ts         a run rendered for an admin screen: blockedOn + history as a timeline
+  view.ts         a run rendered for an admin screen: blockedOn + history as a
+                  timeline, and a chain's generations stitched onto one axis
   dashboard.ts    that view as HTML: one fetch handler, routed by query string
   children.ts     how a parent names its child and the signal the engine answers on
   saga.ts         the undos a failing run owes, newest first, and how it reports them
@@ -850,10 +883,11 @@ src/
   stores/postgres.ts   JSONB record + mirrored query columns + SKIP LOCKED claim + LISTEN/NOTIFY
                        both keep a (tag, run) table beside the record, indexed in listing order
 tests/
-  engine.test.ts        115 tests with a hand-driven clock: memoisation, durable
+  engine.test.ts        120 tests with a hand-driven clock: memoisation, durable
                         backoff, early signals, timeouts, nondeterminism, leases,
                         listing, the run view, child runs, compaction, the
-                        lifecycle hooks, scheduled starts, continuations,
+                        lifecycle hooks, scheduled starts, continuations read
+                        per generation and as one chain,
                         saga compensation, typed signals, step timeouts, tags,
                         and a worker reacting to wakeups a test sends by hand
   dashboard.test.ts     16 tests driving the handler the way a browser does:
@@ -884,12 +918,13 @@ CI runs the full suite, Postgres included, on every push.
 - **Migrating an in-flight run between versions.** A run finishes on the
   version it started on; there is no hook to rewrite its history onto the next
   one. Keep the old definition registered until those runs drain.
-- **A view over a whole continuation chain.** `engine.list` and `engine.view`
-  answer about one run, and a chain is a run per generation, so an operator
-  following one walks it by id — `run-1`, `run-1~2` — rather than reading it as
-  a single timeline. A tag names every generation at once, which is how to get
-  the chain's runs back in one query; stitching their timelines into one is
-  still the caller's job.
+- **A chain on the run list, and on the dashboard.** `engine.viewChain` reads a
+  chain as one piece of work, but `engine.list` and the screen over it are still
+  a page of runs: a chain of nine generations is nine rows, and the dashboard
+  links to one run's timeline. Collapsing them would mean a listing that reads
+  every row's chain to decide whether to show it, against an index that orders
+  runs and knows nothing about generations. A tag names every generation at
+  once, which is how to get a chain's runs back in one query.
 - **Retagging a run, and matching several tags at once.** `engine.start` is the
   only place tags are set and `engine.list` takes one tag, not a set. Tags are
   the run's identity in the application's terms, which does not change while it
