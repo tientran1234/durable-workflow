@@ -20,7 +20,7 @@ import { type ScheduleOptions, type ScheduledRun, schedulePeriod, scheduleRunId 
 import { type SignalDefinition, SignalRegistry, recordRejection, signalName } from "./signals.js";
 import { normalizeTags } from "./tags.js";
 import type { ChildHandle, RetryPolicy, RunPage, RunQuery, RunRecord, RunStore, WorkflowDefinition } from "./types.js";
-import { type RunView, renderRun } from "./view.js";
+import { type ChainView, type RunView, renderChain, renderRun } from "./view.js";
 import { WorkflowRegistry, runVersion } from "./versions.js";
 import { WorkerWait, isWakeupSource } from "./wakeups.js";
 
@@ -174,6 +174,37 @@ export class Engine {
   async view(id: string): Promise<RunView | null> {
     const run = await this.store.get(id);
     return run ? renderRun(run) : null;
+  }
+
+  /**
+   * The whole continuation chain the run belongs to, as one piece of work:
+   * every generation's view oldest first, their timelines on one axis, and the
+   * chain's own input, outcome and elapsed time.
+   *
+   * `view` answers about the record you named, which is what makes a
+   * generation inspectable on its own. This is the other question — an
+   * operator holding `run-1` wants what happened to the work, not what
+   * happened before the first handover — and either id answers it, since the
+   * chain is found from the root the run names rather than from the id passed in.
+   *
+   * It reads once per generation, the same walk `signal` and `cancel` already
+   * do to find the live run. A chain long enough for that to matter is one
+   * whose generations an operator should be reading a page of with `list({ tag })`.
+   */
+  async viewChain(id: string): Promise<ChainView | null> {
+    const named = await this.store.get(id);
+    if (!named) return null;
+
+    // Forward along the recorded handovers rather than by deriving the ids:
+    // the pointer is what live() follows, so this renders the chain the engine
+    // would address and not one the naming scheme implies.
+    let run = chainRoot(named) === named.id ? named : await this.load(chainRoot(named));
+    const generations = [run];
+    while (run.continuation) {
+      run = await this.load(run.continuation.runId);
+      generations.push(run);
+    }
+    return renderChain(generations);
   }
 
   /**

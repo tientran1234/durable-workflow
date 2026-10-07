@@ -1624,6 +1624,100 @@ describe("continuations", () => {
     expect(completed.map((e) => e.runId)).toEqual(["r1~3"]);
   });
 
+  describe("the chain as one view", () => {
+    /** Three generations with a step apiece, a wait at the end, and a tag on the chain. */
+    const relay = defineWorkflow<{ left: number }, string>("relayed", async (ctx, input) => {
+      await ctx.step(`leg-${input.left}`, () => input.left);
+      if (input.left > 1) {
+        await ctx.sleep("breathe", 1_000);
+        return ctx.continueAsNew({ left: input.left - 1 });
+      }
+      return ctx.waitFor<string>("baton");
+    });
+
+    async function chain() {
+      const h = harness([relay]);
+      await h.engine.start(relay, { left: 3 }, { id: "r1", tags: ["order:ord_7"] });
+      for (let i = 0; i < 2; i++) {
+        await h.drain();
+        h.advance(1_000);
+      }
+      await h.drain();
+      return h;
+    }
+
+    it("stitches every generation's events onto one axis of offsets from the root", async () => {
+      const { engine } = await chain();
+
+      const view = await engine.viewChain("r1");
+      expect(view?.generations).toBe(3);
+      expect(view?.runs.map((r) => r.id)).toEqual(["r1", "r1~2", "r1~3"]);
+      expect(view?.timeline.map((e) => [e.generation, e.runId, e.elapsedMs, e.summary])).toEqual([
+        [1, "r1", 0, 'step "leg-3" completed'],
+        [1, "r1", 1_000, 'timer "breathe" fired'],
+        [2, "r1~2", 1_000, 'step "leg-2" completed'],
+        [2, "r1~2", 2_000, 'timer "breathe" fired'],
+        [3, "r1~3", 2_000, 'step "leg-1" completed'],
+      ]);
+      // Each generation's own view still reads from its own start, which is
+      // what the per-run timeline is for.
+      expect(view?.runs.map((r) => r.timeline.map((e) => e.elapsedMs))).toEqual([[0, 1_000], [0, 1_000], [0]]);
+      expect(JSON.parse(JSON.stringify(view))).toEqual(view); // an admin endpoint can send it as-is
+    });
+
+    it("answers about the work: the chain's input, the live generation and its wait", async () => {
+      const { engine } = await chain();
+
+      const view = await engine.viewChain("r1");
+      expect(view?.root).toBe("r1");
+      expect(view?.live).toBe("r1~3");
+      expect(view?.status).toBe("waiting");
+      expect(view?.input).toEqual({ left: 3 }); // what the chain was asked to do
+      expect(view?.output).toBeUndefined();
+      expect(view?.blockedOn).toEqual({ kind: "signal", name: "baton", until: null });
+      expect(view?.tags).toEqual(["order:ord_7"]);
+      expect(view?.createdAt).toBe(T0);
+      expect(view?.durationMs).toBe(2_000); // the root's start to the live generation's last write
+    });
+
+    it("answers the same from any id in the chain, including one six generations old", async () => {
+      const { engine } = await chain();
+
+      const [fromRoot, fromMiddle, fromLive] = await Promise.all([
+        engine.viewChain("r1"),
+        engine.viewChain("r1~2"),
+        engine.viewChain("r1~3"),
+      ]);
+      expect(fromMiddle).toEqual(fromRoot);
+      expect(fromLive).toEqual(fromRoot);
+    });
+
+    it("reports the outcome the last generation produced, once the chain ends", async () => {
+      const { engine, advance } = await chain();
+      advance(500);
+      await engine.signal("r1", "baton", "home"); // the id the caller has held all along
+
+      const view = await engine.viewChain("r1");
+      expect(view?.status).toBe("completed");
+      expect(view?.output).toBe("home");
+      expect(view?.blockedOn).toBeNull();
+      expect(view?.durationMs).toBe(2_500);
+      expect(view?.timeline.at(-1)).toMatchObject({ generation: 3, summary: 'signal "baton" received' });
+    });
+
+    it("renders a run that never continued as a chain of one", async () => {
+      const wf = defineWorkflow<null, string>("single", async (ctx) => ctx.step("once", () => "done"));
+      const { engine, drain } = harness([wf]);
+      await engine.start(wf, null, { id: "r1" });
+      await drain();
+
+      const view = await engine.viewChain("r1");
+      expect(view).toMatchObject({ root: "r1", live: "r1", generations: 1, status: "completed", output: "done" });
+      expect(view?.timeline.map((e) => [e.generation, e.runId])).toEqual([[1, "r1"]]);
+      expect(await engine.viewChain("no-such-run")).toBeNull();
+    });
+  });
+
   it("shows an operator which generation a run is and where the work went", async () => {
     const { engine, drain } = harness([batches]);
     await engine.start(batches, { left: 2, done: 0 }, { id: "r1" });
