@@ -54,8 +54,8 @@ export type { Wakeup, WakeupSource, WakeupSubscription } from "./wakeups.js";
 // Tags: the application's names for a run, and what a store must index them as.
 export { MAX_TAGS, MAX_TAG_LENGTH, hasTag, normalizeTags, queryTag } from "./tags.js";
 
-export { renderRun } from "./view.js";
-export type { RunBlockedOn, RunView, TimelineEntry } from "./view.js";
+export { renderChain, renderRun } from "./view.js";
+export type { ChainTimelineEntry, ChainView, RunBlockedOn, RunView, TimelineEntry } from "./view.js";
 
 // The admin screen over that view: one fetch handler, self-contained HTML.
 export { DASHBOARD_LIMIT, dashboard } from "./dashboard.js";

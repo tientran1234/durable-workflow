@@ -70,6 +70,59 @@ export interface RunView {
   timeline: TimelineEntry[];
 }
 
+/**
+ * One history event on a chain's timeline: the line a single run's timeline
+ * carries, plus which generation it came off.
+ */
+export interface ChainTimelineEntry extends TimelineEntry {
+  generation: number;
+  runId: string;
+}
+
+/**
+ * A continuation chain rendered as the one piece of work it is: every
+ * generation's view, oldest first, and their timelines on a single axis.
+ *
+ * The fields a chain has in common with a run answer about the chain rather
+ * than about any generation of it — the input it was started with, the outcome
+ * the last generation reported, the whole elapsed time — because that is the
+ * question an operator holding an order id is asking.
+ */
+export interface ChainView {
+  /** The id the chain started under, which every generation's id derives from. */
+  root: string;
+  /** The generation carrying the work now: the run `signal` and `cancel` reach. */
+  live: string;
+  workflow: string;
+  /** How many generations the chain has reached so far. */
+  generations: number;
+  /**
+   * The live generation's status. `continued` cannot appear here: a run with a
+   * successor is not the live one.
+   */
+  status: RunStatus;
+  /** What the chain was started with — the root's input, not the live generation's. */
+  input: unknown;
+  /** The outcome the chain reported, which is the last generation's. */
+  output: unknown;
+  error: string | null;
+  blockedOn: RunBlockedOn | null;
+  /** The chain's names, as `list({ tag })` matches them. Tags follow a handover. */
+  tags: string[];
+  /** The root's start, so an offset on the timeline below is an age of the work. */
+  createdAt: number;
+  updatedAt: number;
+  durationMs: number;
+  /** Each generation as `view` renders it, oldest first. */
+  runs: RunView[];
+  /**
+   * Every generation's events on one axis, in order, each saying which run it
+   * is recorded on. A handover has no event of its own — nothing replays it —
+   * so the only thing that marks one is `generation` changing.
+   */
+  timeline: ChainTimelineEntry[];
+}
+
 export function renderRun(run: RunRecord): RunView {
   return {
     id: run.id,
@@ -104,6 +157,49 @@ export function renderRun(run: RunRecord): RunView {
         name: event.name,
         summary: summarise(event),
       })),
+  };
+}
+
+/**
+ * Render a chain from its generations, oldest first, as the caller's walk along
+ * the recorded handovers produced them.
+ *
+ * The last generation is the live one by construction: the walk ends at the run
+ * that names no successor. A crash between creating a successor and recording
+ * the handover leaves the predecessor last for one tick, which is also the run
+ * a signal would reach, so the view and the engine agree about what is live
+ * even while they are both wrong about it.
+ */
+export function renderChain(generations: RunRecord[]): ChainView {
+  const runs = generations.map(renderRun);
+  const root = runs[0]!;
+  const live = runs[runs.length - 1]!;
+  return {
+    root: root.id,
+    live: live.id,
+    workflow: live.workflow,
+    generations: runs.length,
+    status: live.status,
+    input: root.input,
+    output: live.output,
+    error: live.error,
+    blockedOn: live.blockedOn,
+    tags: live.tags,
+    createdAt: root.createdAt,
+    updatedAt: live.updatedAt,
+    durationMs: live.updatedAt - root.createdAt,
+    runs,
+    timeline: runs.flatMap((run) =>
+      run.timeline.map((entry) => ({
+        ...entry,
+        // Offsets from the root rather than from the generation the event is
+        // on: one axis is the point, and a per-run offset would restart at
+        // zero at every handover.
+        elapsedMs: entry.at - root.createdAt,
+        generation: run.chain.generation,
+        runId: run.id,
+      })),
+    ),
   };
 }
 
