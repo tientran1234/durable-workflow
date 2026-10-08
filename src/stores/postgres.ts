@@ -28,7 +28,8 @@ const quoted = (channel: string): string => `"${channel.replace(/"/g, '""')}"`;
  * Postgres-backed store. The full record lives in a JSONB column; the columns
  * a worker queries by (status, wake_at, lease_until, version) are mirrored so
  * claimDue is one indexed statement, and a run's tags are mirrored into a
- * table beside it so a tag query is one indexed statement too.
+ * table beside it so a tag query — one tag or a set of them — is one indexed
+ * statement too.
  *
  * It is also the one store that can tell a worker a run became due instead of
  * waiting to be asked: every write that leaves a run claimable sends a
@@ -187,7 +188,22 @@ export class PostgresStore implements RunStore, WakeupSource {
   async list(query: RunQuery): Promise<RunPage> {
     const limit = pageLimit(query.limit);
     const cursor = query.cursor === undefined ? null : decodeCursor(query.cursor);
-    const [tag] = queryTags(query.tag);
+    const [tag, ...rest] = queryTags(query.tag);
+    // Every tag past the first is a predicate on a candidate the tag index has
+    // already named, not a second way into the table: the set still enters
+    // through one tag's range scan, so the rows arrive in listing order and the
+    // query stops at LIMIT. Each extra tag is then one primary-key probe per
+    // candidate row — cheaper than intersecting every tag's runs, which the
+    // planner would have to collect and sort in full before it could order
+    // anything, for a page it then throws most of away. The anchor is whichever
+    // tag queryTags sorted first: nothing here knows which of them is the rare
+    // one, and making the caller say would make them answer for the shape of
+    // their own table.
+    const carriesRest =
+      rest.length === 0
+        ? ""
+        : `AND (SELECT count(*) FROM ${this.tagTable} o
+                 WHERE o.run_id = t.run_id AND o.tag = ANY($7::text[])) = cardinality($7::text[])`;
     const filters = [
       query.workflow ?? null,
       query.status ?? null,
@@ -216,9 +232,10 @@ export class PostgresStore implements RunStore, WakeupSource {
                 AND ($1::text IS NULL OR r.workflow = $1)
                 AND ($2::text IS NULL OR r.status = $2)
                 AND ($3::bigint IS NULL OR (t.created_at, t.run_id) < ($3::bigint, $4::text))
+                ${carriesRest}
               ORDER BY t.created_at DESC, t.run_id DESC
               LIMIT $5`,
-            [...filters, tag],
+            rest.length === 0 ? [...filters, tag] : [...filters, tag, rest],
           );
     // One extra row tells us whether a next page exists without a second query.
     const runs = rows.slice(0, limit).map((row) => this.hydrate(row));

@@ -46,7 +46,7 @@ export class MemoryStore implements RunStore {
       .filter((r) => query.status === undefined || r.status === query.status)
       // Nothing is indexed in a Map, so a tag here is the scan the durable
       // stores exist to avoid; the answer is the same either way.
-      .filter((r) => tags.length === 0 || hasTag(r, tags[0]!))
+      .filter((r) => tags.every((tag) => hasTag(r, tag)))
       .filter((r) => cursor === null || afterCursor(r, cursor))
       .sort(byNewest);
 

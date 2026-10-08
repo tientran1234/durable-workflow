@@ -167,12 +167,24 @@ export class SqliteStore implements RunStore {
    * And, as there, a tag is a second statement rather than another predicate:
    * the tag index names the runs and their order, so the query reads the page
    * it returns instead of walking runs newest-first and discarding the ones
-   * without the tag.
+   * without the tag. A set of tags seeks on one of them and probes the same
+   * index for the rest; see the Postgres store for why that beats an
+   * intersection.
    */
   async list(query: RunQuery): Promise<RunPage> {
     const limit = pageLimit(query.limit);
     const cursor = query.cursor === undefined ? null : decodeCursor(query.cursor);
-    const [tag] = queryTags(query.tag);
+    const [tag, ...rest] = queryTags(query.tag);
+    // The same shape as the Postgres store: one tag's range scan is how the set
+    // enters the table, and the rest are probes into the same (tag, run_id) key
+    // on the candidates it names, so the page still comes out in listing order
+    // and the query stops at LIMIT.
+    const carriesRest =
+      rest.length === 0
+        ? ""
+        : `AND (SELECT count(*) FROM ${this.tagTable} o
+                 WHERE o.run_id = t.run_id
+                   AND o.tag IN (SELECT value FROM json_each(@rest))) = json_array_length(@rest)`;
     const filters = {
       workflow: query.workflow ?? null,
       status: query.status ?? null,
@@ -194,7 +206,7 @@ export class SqliteStore implements RunStore {
             )
             .all(filters)
         : this.db
-            .prepare<Filters & { tag: string }, Row>(
+            .prepare<Filters & { tag: string; rest?: string }, Row>(
               // The cursor is compared against the tag table's own columns,
               // which is what keeps the whole page one range scan of its index.
               `SELECT r.data, r.status, r.wake_at, r.lease_until, r.version
@@ -204,10 +216,11 @@ export class SqliteStore implements RunStore {
                   AND (@workflow IS NULL OR r.workflow = @workflow)
                   AND (@status IS NULL OR r.status = @status)
                   AND (@createdAt IS NULL OR (t.created_at, t.run_id) < (@createdAt, @id))
+                  ${carriesRest}
                 ORDER BY t.created_at DESC, t.run_id DESC
                 LIMIT @limit`,
             )
-            .all({ ...filters, tag });
+            .all({ ...filters, tag, ...(rest.length === 0 ? {} : { rest: JSON.stringify(rest) }) });
     // One extra row tells us whether a next page exists without a second query.
     const runs = rows.slice(0, limit).map((row) => this.hydrate(row));
     const last = runs[runs.length - 1];

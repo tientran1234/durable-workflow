@@ -204,6 +204,44 @@ describe("SqliteStore", () => {
     expect(plan.join("\n")).not.toMatch(/TEMP B-TREE/);
   });
 
+  it("answers a set of tags from the same index, still without sorting", async () => {
+    const engine = new Engine({ store, workflows: [wf], now: () => T0 });
+    await engine.start(wf, { n: 1 }, { id: "r1", tags: ["order:1", "tenant:acme"] });
+    await engine.start(wf, { n: 1 }, { id: "r2", tags: ["order:1"] });
+    await engine.start(wf, { n: 1 }, { id: "r3", tags: ["tenant:acme"] });
+
+    expect((await engine.list({ tag: ["order:1", "tenant:acme"] })).runs.map((r) => r.id)).toEqual(["r1"]);
+
+    const prepare = db.prepare.bind(db);
+    let sql: string | null = null;
+    db.prepare = ((text: string) => {
+      if (text.includes("workflow_runs_tags")) sql = text;
+      return prepare(text);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    }) as any;
+    await engine.list({ tag: ["order:1", "tenant:acme"] });
+    db.prepare = prepare;
+    expect(sql).not.toBeNull();
+
+    const plan = (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all({
+      tag: "order:1",
+      rest: JSON.stringify(["tenant:acme"]),
+      workflow: null,
+      status: null,
+      createdAt: null,
+      id: null,
+      limit: 51,
+    }) as { detail: string }[]).map((p) => p.detail);
+
+    // The extra tag did not change how the query enters the table: the same
+    // seek supplies the page and its order, and the rest of the set is a probe
+    // into the same index per candidate. A query that intersected the tags
+    // instead would sort, and would read every run carrying either of them.
+    expect(plan.join("\n")).toMatch(/SEARCH t USING COVERING INDEX workflow_runs_tags_recent \(tag=\?\)/);
+    expect(plan.join("\n")).toMatch(/SEARCH o USING COVERING INDEX sqlite_autoindex_workflow_runs_tags_1/);
+    expect(plan.join("\n")).not.toMatch(/TEMP B-TREE/);
+  });
+
   it("hydrates listed runs from the same columns as get()", async () => {
     const engine = new Engine({ store, workflows: [wf], now: () => T0 });
     const id = await engine.start(wf, { n: 21 });

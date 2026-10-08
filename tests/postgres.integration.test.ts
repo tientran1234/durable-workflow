@@ -129,6 +129,24 @@ describe.skipIf(!url)("PostgresStore", () => {
     expect((await engine.list({ tag: "tenant:nobody" })).runs).toEqual([]);
   });
 
+  it("narrows to the runs carrying every tag in a set, and pages them", async () => {
+    const engine = new Engine({ store, workflows: [wf], now: () => T0 });
+    for (const id of ["r1", "r2", "r3"]) {
+      await engine.start(wf, { n: 1 }, { id, tags: ["tenant:acme", id === "r2" ? "order:2" : "order:1"] });
+    }
+    await engine.start(wf, { n: 1 }, { id: "r4", tags: ["order:1"] });
+
+    // r4 carries the order but not the tenant, r2 the tenant but not the
+    // order: the set is both, which is neither tag's own answer.
+    expect((await engine.list({ tag: "order:1" })).runs.map((r) => r.id)).toEqual(["r4", "r3", "r1"]);
+    const page = await engine.list({ tag: ["tenant:acme", "order:1"], limit: 1 });
+    expect(page.runs.map((r) => r.id)).toEqual(["r3"]);
+    const next = await engine.list({ tag: ["tenant:acme", "order:1"], limit: 1, cursor: page.cursor ?? "" });
+    expect(next.runs.map((r) => r.id)).toEqual(["r1"]);
+    expect(next.cursor).toBeNull();
+    expect((await engine.list({ tag: ["tenant:acme", "order:nobody"] })).runs).toEqual([]);
+  });
+
   it("answers a tag query from the tag index, in order, without sorting", async () => {
     const engine = new Engine({ store, workflows: [wf], now: () => T0 });
     await engine.start(wf, { n: 1 }, { id: "r1", tags: ["order:1"] });
@@ -163,6 +181,24 @@ describe.skipIf(!url)("PostgresStore", () => {
       // and would put a Sort above it.
       expect(plan).toMatch(/Index Only Scan using workflow_runs_test_tags_recent/);
       expect(plan).not.toMatch(/Sort/);
+
+      // And a set of tags enters the table the same way: the extra tags are a
+      // subquery on the rows that scan already named, so they add probes into
+      // the same index rather than a second scan to intersect and sort.
+      captured = null;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      pool.query = (text: any, values?: any) => {
+        if (typeof text === "string" && text.includes("workflow_runs_test_tags")) captured = { text, values };
+        return query(text, values);
+      };
+      await engine.list({ tag: ["order:1", "tenant:acme"] });
+      pool.query = query;
+      expect(captured).not.toBeNull();
+      const forSet = await client.query(`EXPLAIN (COSTS OFF) ${captured!.text}`, captured!.values);
+      const setPlan = forSet.rows.map((row: Record<string, string>) => row["QUERY PLAN"]).join("\n");
+
+      expect(setPlan).toMatch(/Index Only Scan using workflow_runs_test_tags_recent/);
+      expect(setPlan).not.toMatch(/Sort/);
     } finally {
       client.release();
     }

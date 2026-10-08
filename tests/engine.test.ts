@@ -743,8 +743,11 @@ describe("tags", () => {
 
   it("matches a set alongside workflow, status and the single-tag spelling", async () => {
     const { engine } = harness([counter, waiter]);
-    await engine.start(counter, null, { id: "c1", tags: ["order:1", "tenant:acme"] });
-    await engine.start(waiter, null, { id: "w1", tags: ["order:1", "tenant:acme"] });
+    const c = await engine.start(counter, null, { id: "c1", tags: ["order:1", "tenant:acme"] });
+    const w = await engine.start(waiter, null, { id: "w1", tags: ["order:1", "tenant:acme"] });
+    // Tagged identically, so only workflow and status can part them.
+    await engine.settle(c);
+    await engine.settle(w);
 
     expect((await engine.list({ tag: ["order:1", "tenant:acme"], workflow: "waiter" })).runs.map((r) => r.id)).toEqual(
       ["w1"],
