@@ -32,23 +32,42 @@ export const MAX_TAG_LENGTH = 128;
  */
 export function normalizeTags(tags: readonly string[]): string[] {
   if (tags.length > MAX_TAGS) throw new Error(`a run may carry at most ${MAX_TAGS} tags, got ${tags.length}`);
-  const seen = new Set<string>();
-  for (const tag of tags) seen.add(validTag(tag));
-  return [...seen].sort();
+  return normalized(tags);
 }
 
 /**
- * The tag a `list({ tag })` query means, or null if it did not ask for one.
+ * The tags a `list({ tag })` query means: none, one, or a set of them. A run
+ * matches a set only by carrying every tag in it, so the set narrows the
+ * listing the way `workflow` and `status` do rather than widening it.
+ *
+ * Normalized exactly as a run's own tags are, because the two are compared: a
+ * query spelled `" order:1 "` has to reach the run stored under `"order:1"`.
+ * An empty set asks for nothing and so narrows nothing, which is what a caller
+ * assembling a query from filters the operator left blank means by it.
+ *
  * Every store calls this, the way each one calls `pageLimit`: the same spelling
- * has to match the same runs whichever store answers.
+ * has to match the same runs whichever store answers. It replaces the
+ * single-tag reader stores used to call, rather than sitting beside it, so a
+ * store written against that one fails to compile instead of quietly answering
+ * a two-tag query with the first tag's runs.
  */
-export function queryTag(tag: string | undefined): string | null {
-  return tag === undefined ? null : validTag(tag);
+export function queryTags(tag: string | readonly string[] | undefined): string[] {
+  if (tag === undefined) return [];
+  if (typeof tag === "string") return [validTag(tag)];
+  if (tag.length > MAX_TAGS) throw new Error(`a tag query may name at most ${MAX_TAGS} tags, got ${tag.length}`);
+  return normalized(tag);
 }
 
 /** Does this run carry `tag`? For stores that filter in memory. */
 export function hasTag(run: Pick<RunRecord, "tags">, tag: string): boolean {
   return run.tags?.includes(tag) ?? false;
+}
+
+/** Trimmed, deduplicated and sorted — the one spelling a tag is stored and matched under. */
+function normalized(tags: readonly string[]): string[] {
+  const seen = new Set<string>();
+  for (const tag of tags) seen.add(validTag(tag));
+  return [...seen].sort();
 }
 
 function validTag(tag: string): string {

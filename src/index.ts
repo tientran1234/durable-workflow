@@ -52,7 +52,7 @@ export { MAX_PENDING_WAKEUPS, WorkerWait, decodeWakeup, encodeWakeup, isWakeupSo
 export type { Wakeup, WakeupSource, WakeupSubscription } from "./wakeups.js";
 
 // Tags: the application's names for a run, and what a store must index them as.
-export { MAX_TAGS, MAX_TAG_LENGTH, hasTag, normalizeTags, queryTag } from "./tags.js";
+export { MAX_TAGS, MAX_TAG_LENGTH, hasTag, normalizeTags, queryTags } from "./tags.js";
 
 export { renderChain, renderRun } from "./view.js";
 export type { ChainTimelineEntry, ChainView, RunBlockedOn, RunView, TimelineEntry } from "./view.js";

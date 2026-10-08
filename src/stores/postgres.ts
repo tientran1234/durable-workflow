@@ -1,6 +1,6 @@
 import type { Notification, Pool } from "pg";
 import { decodeCursor, encodeCursor, pageLimit } from "../list.js";
-import { queryTag } from "../tags.js";
+import { queryTags } from "../tags.js";
 import type { RunPage, RunQuery, RunRecord, RunStore } from "../types.js";
 import { type Wakeup, type WakeupSource, type WakeupSubscription, decodeWakeup, encodeWakeup, wakeupFor } from "../wakeups.js";
 
@@ -187,7 +187,7 @@ export class PostgresStore implements RunStore, WakeupSource {
   async list(query: RunQuery): Promise<RunPage> {
     const limit = pageLimit(query.limit);
     const cursor = query.cursor === undefined ? null : decodeCursor(query.cursor);
-    const tag = queryTag(query.tag);
+    const [tag] = queryTags(query.tag);
     const filters = [
       query.workflow ?? null,
       query.status ?? null,
@@ -196,7 +196,7 @@ export class PostgresStore implements RunStore, WakeupSource {
       limit + 1,
     ];
     const { rows } =
-      tag === null
+      tag === undefined
         ? await this.pool.query<Row>(
             `SELECT r.data, r.status, r.wake_at, r.lease_until, r.version FROM ${this.table} r
               WHERE ($1::text IS NULL OR r.workflow = $1)

@@ -725,6 +725,62 @@ describe("tags", () => {
     expect((await engine.list({ tag: " order:1  " })).runs.map((r) => r.id)).toEqual(["r1"]);
   });
 
+  it("narrows to the runs carrying every tag in a set", async () => {
+    const { engine } = harness([counter, waiter]);
+    await engine.start(counter, null, { id: "c1", tags: ["order:4182", "tenant:acme"] });
+    await engine.start(counter, null, { id: "c2", tags: ["order:4182", "tenant:other"] });
+    await engine.start(waiter, null, { id: "w1", tags: ["tenant:acme"] });
+
+    // Each tag on its own matches two runs; together they match the one run
+    // that carries both, which is the question an operator holding a tenant
+    // and an order is actually asking.
+    expect((await engine.list({ tag: "order:4182" })).runs.map((r) => r.id)).toEqual(["c2", "c1"]);
+    expect((await engine.list({ tag: "tenant:acme" })).runs.map((r) => r.id)).toEqual(["w1", "c1"]);
+    expect((await engine.list({ tag: ["order:4182", "tenant:acme"] })).runs.map((r) => r.id)).toEqual(["c1"]);
+    // A tag the run does not carry takes it out, however many of the rest match.
+    expect((await engine.list({ tag: ["order:4182", "tenant:acme", "nope"] })).runs).toEqual([]);
+  });
+
+  it("matches a set alongside workflow, status and the single-tag spelling", async () => {
+    const { engine } = harness([counter, waiter]);
+    await engine.start(counter, null, { id: "c1", tags: ["order:1", "tenant:acme"] });
+    await engine.start(waiter, null, { id: "w1", tags: ["order:1", "tenant:acme"] });
+
+    expect((await engine.list({ tag: ["order:1", "tenant:acme"], workflow: "waiter" })).runs.map((r) => r.id)).toEqual(
+      ["w1"],
+    );
+    expect((await engine.list({ tag: ["order:1", "tenant:acme"], status: "completed" })).runs.map((r) => r.id)).toEqual(
+      ["c1"],
+    );
+    // One tag in a set is the same query as that tag on its own, and a set
+    // is trimmed, deduplicated and order-insensitive like a run's own tags.
+    expect((await engine.list({ tag: ["order:1"] })).runs.map((r) => r.id)).toEqual(["w1", "c1"]);
+    expect((await engine.list({ tag: [" tenant:acme ", "order:1", "order:1"] })).runs.map((r) => r.id)).toEqual([
+      "w1",
+      "c1",
+    ]);
+    // Narrowing by nothing is not narrowing: an empty set is no tag filter,
+    // which is what a query assembled from blank operator filters means.
+    expect((await engine.list({ tag: [] })).runs.map((r) => r.id)).toEqual(["w1", "c1"]);
+  });
+
+  it("pages a set of tags by keyset, without repeating or skipping a run", async () => {
+    const { engine } = harness([counter]);
+    for (const id of ["r1", "r2", "r3", "r4", "r5"]) {
+      // Every run carries "all", so the set is only narrowed by the second
+      // tag — and a store filtering it after the page limit rather than
+      // inside the query would hand back short pages and a cursor that skips.
+      const odd = Number(id.slice(1)) % 2 === 1;
+      await engine.start(counter, null, { id, tags: odd ? ["all", "odd"] : ["all", "even"] });
+    }
+
+    const first = await engine.list({ tag: ["all", "odd"], limit: 2 });
+    expect(first.runs.map((r) => r.id)).toEqual(["r5", "r3"]);
+    const second = await engine.list({ tag: ["all", "odd"], limit: 2, cursor: first.cursor ?? "" });
+    expect(second.runs.map((r) => r.id)).toEqual(["r1"]);
+    expect(second.cursor).toBeNull();
+  });
+
   it("refuses a tag it could not index rather than dropping it", async () => {
     const { engine } = harness([counter]);
     const startWith = (tags: string[]) => engine.start(counter, null, { tags });
@@ -737,6 +793,12 @@ describe("tags", () => {
     // Refused at the door: nothing was created under a tag that would not match.
     expect((await engine.list()).runs).toEqual([]);
     await expect(engine.list({ tag: " " })).rejects.toThrow(/tag cannot be empty/);
+    // A set is held to the same rules, so a query cannot ask for a spelling
+    // no run could have been created under.
+    await expect(engine.list({ tag: ["ok", " "] })).rejects.toThrow(/tag cannot be empty/);
+    await expect(engine.list({ tag: Array.from({ length: MAX_TAGS + 1 }, (_, i) => `t${i}`) })).rejects.toThrow(
+      /at most/,
+    );
   });
 
   it("pages a tag query by keyset, without repeating or skipping a run", async () => {

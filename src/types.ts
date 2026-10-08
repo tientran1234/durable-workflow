@@ -261,8 +261,11 @@ export function defineWorkflow<Input, Output>(
 export interface RunQuery {
   workflow?: string;
   status?: RunStatus;
-  /** Runs carrying this tag. Matched whole and exactly, after trimming. */
-  tag?: string;
+  /**
+   * Runs carrying this tag — or, given a set, every tag in it. Matched whole
+   * and exactly, after trimming.
+   */
+  tag?: string | readonly string[];
   /** Page size. Defaults to 50, capped at 500. */
   limit?: number;
   /** Opaque position from the previous page's `cursor`. */
@@ -295,7 +298,9 @@ export interface RunStore {
    *
    * `query.tag` must be answered from an index rather than by reading runs:
    * finding the run for one order is the one listing an operator does while
-   * every other run in the table is irrelevant.
+   * every other run in the table is irrelevant. A set of tags is the same
+   * index: seek one of them and require the rest of the run, which is work
+   * proportional to the tag asked for rather than to the table.
    */
   list(query: RunQuery): Promise<RunPage>;
 }

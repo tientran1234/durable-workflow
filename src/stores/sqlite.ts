@@ -1,6 +1,6 @@
 import type { Database } from "better-sqlite3";
 import { decodeCursor, encodeCursor, pageLimit } from "../list.js";
-import { queryTag } from "../tags.js";
+import { queryTags } from "../tags.js";
 import type { RunPage, RunQuery, RunRecord, RunStore } from "../types.js";
 
 interface Row {
@@ -172,7 +172,7 @@ export class SqliteStore implements RunStore {
   async list(query: RunQuery): Promise<RunPage> {
     const limit = pageLimit(query.limit);
     const cursor = query.cursor === undefined ? null : decodeCursor(query.cursor);
-    const tag = queryTag(query.tag);
+    const [tag] = queryTags(query.tag);
     const filters = {
       workflow: query.workflow ?? null,
       status: query.status ?? null,
@@ -182,7 +182,7 @@ export class SqliteStore implements RunStore {
     };
     type Filters = typeof filters;
     const rows =
-      tag === null
+      tag === undefined
         ? this.db
             .prepare<Filters, Row>(
               `SELECT data, status, wake_at, lease_until, version FROM ${this.table}

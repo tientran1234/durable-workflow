@@ -164,7 +164,8 @@ export class Engine {
 
   /**
    * A page of runs, newest first. Pass the page's `cursor` back for the next
-   * one, and `tag` to find the runs for one order, tenant or invoice.
+   * one, and `tag` to find the runs for one order, tenant or invoice — or a
+   * set of tags for the runs carrying all of them.
    */
   list(query: RunQuery = {}): Promise<RunPage> {
     return this.store.list(query);

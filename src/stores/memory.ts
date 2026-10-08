@@ -1,6 +1,6 @@
 import { isDue } from "../due.js";
 import { afterCursor, byNewest, decodeCursor, encodeCursor, pageLimit } from "../list.js";
-import { hasTag, queryTag } from "../tags.js";
+import { hasTag, queryTags } from "../tags.js";
 import type { RunPage, RunQuery, RunRecord, RunStore } from "../types.js";
 
 /** In-process store. Every read returns a copy, so callers cannot bypass save(). */
@@ -40,13 +40,13 @@ export class MemoryStore implements RunStore {
   async list(query: RunQuery): Promise<RunPage> {
     const limit = pageLimit(query.limit);
     const cursor = query.cursor === undefined ? null : decodeCursor(query.cursor);
-    const tag = queryTag(query.tag);
+    const tags = queryTags(query.tag);
     const matched = [...this.runs.values()]
       .filter((r) => query.workflow === undefined || r.workflow === query.workflow)
       .filter((r) => query.status === undefined || r.status === query.status)
       // Nothing is indexed in a Map, so a tag here is the scan the durable
       // stores exist to avoid; the answer is the same either way.
-      .filter((r) => tag === null || hasTag(r, tag))
+      .filter((r) => tags.length === 0 || hasTag(r, tags[0]!))
       .filter((r) => cursor === null || afterCursor(r, cursor))
       .sort(byNewest);
 
