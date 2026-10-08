@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-08
+
+- Matching several tags at once: `engine.list({ tag: [...] })` returns the runs carrying every tag in the set, answered from the same index both durable stores already keep — the set enters the table through one tag's range scan, so the page still arrives in listing order and still stops at `limit`, and the rest of the set is a key probe per row that seek already named, rather than an intersection the planner would have to collect and sort in full before it could order a page.
+
 ## 2026-10-07
 
 - A view over a whole continuation chain: `engine.viewChain(id)` answers from any id in the chain, with every generation's view and their timelines on one axis — the walk follows the recorded handovers from the root the named run carries, the same one `signal` and `cancel` take to reach the live generation, so an id from six generations ago reads the work rather than the record it names, and offsets run from the root because a per-run offset restarts at zero at every handover.

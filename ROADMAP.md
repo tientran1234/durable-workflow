@@ -22,4 +22,4 @@ Same rule: one item per change, in order.
 - [x] Event-driven wakeups: Postgres `LISTEN/NOTIFY` on run changes so a worker wakes immediately on a signal or a due timer instead of waiting for the poll interval; polling stays as the fallback.
 - [x] Dashboard: `engine.dashboard()` returns a single-file HTML handler (fetch-compatible) listing runs, rendering the timeline from `engine.view`, with a form to send a signal.
 - [x] A view over a whole continuation chain: `engine.viewChain(id)` answers from any id in the chain, with every generation's view and their timelines on one axis.
-- [ ] Matching several tags at once: `engine.list({ tag: [...] })` returns the runs carrying every tag in the set, answered from the same index both durable stores already keep.
+- [x] Matching several tags at once: `engine.list({ tag: [...] })` returns the runs carrying every tag in the set, answered from the same index both durable stores already keep.

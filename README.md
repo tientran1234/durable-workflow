@@ -441,19 +441,32 @@ await engine.start(fulfilment, { orderId: "ord_4182" }, { tags: ["order:ord_4182
 
 const { runs } = await engine.list({ tag: "order:ord_4182" });     // which run is handling this?
 await engine.list({ tag: "tenant:acme", status: "waiting", limit: 20 });   // and what is stuck
+await engine.list({ tag: ["tenant:acme", "order:ord_4182"] });     // the run that is both
 ```
 
 A tag query narrows alongside `workflow` and `status` and pages by the same
 cursor as any other listing. Tags are plain strings with no structure the
 engine knows about; `order:` above is a convention, not syntax.
 
+`tag` takes one tag or a set of them, and a set matches only the runs carrying
+every tag in it — an operator who knows the tenant and the order is holding two
+names for one run. The set narrows, so adding a tag can only remove runs from
+the answer, and an empty set narrows nothing, which is what a query assembled
+from filters the operator left blank means. A set is trimmed, deduplicated and
+order-insensitive like a run's own tags, so `["b", " a "]` and `["a", "b"]` are
+the same query.
+
 Tags are fixed when the run starts. They say what the run is about, which is
 settled before the first step, and both durable stores mirror them into an
 index at that point and never have to revisit it. The index is keyed
 `(tag, created_at DESC, run_id DESC)` — the tag, then the order listings come
 out in — so a tag query seeks once and reads the page it returns, whether the
-tag matches one run or a million. Tags also follow `ctx.continueAsNew` into the
-next generation, since the chain is one piece of work under one set of names; a
+tag matches one run or a million. A set of tags enters the table the same way,
+through one of them, and tests the rest as a key probe per row the seek already
+named: the page still arrives in listing order and the query still stops at
+`limit`, where intersecting every tag's runs would mean collecting and sorting
+all of them before a page could be ordered at all. Tags also follow
+`ctx.continueAsNew` into the next generation, since the chain is one piece of work under one set of names; a
 child run is its own work and starts untagged.
 
 A tag that could not be indexed is refused at `engine.start` rather than
@@ -849,10 +862,11 @@ why many workers still want Postgres.
 Any `RunStore` implementation with `create / get / save(version) / claimDue /
 list` works. `save` must be conditional on `version`, `claimDue` must lease
 atomically, `list` must order by `(createdAt, id)` descending, and a
-`list({ tag })` must be answered from an index rather than by reading runs —
-that is the whole contract. A `watch` on top of it makes the store a
-`WakeupSource`; see **Event-driven wakeups** for what a worker does with one,
-and for why it is latency rather than part of the contract.
+`list({ tag })` must be answered from an index rather than by reading runs,
+one tag or a set of them — that is the whole contract. A `watch` on top of it
+makes the store a `WakeupSource`; see **Event-driven wakeups** for what a
+worker does with one, and for why it is latency rather than part of the
+contract.
 
 ## Layout
 
@@ -866,7 +880,7 @@ src/
   due.ts          what "due" means, shared by engine and stores
   versions.ts     the registry: definitions by name and version, and a run's pin
   list.ts         listing order and cursor codec, shared by engine and stores
-  tags.ts         what a tag may be, and why a store indexes them at create
+  tags.ts         what a tag may be, the set a query means, and why a store indexes them at create
   wakeups.ts      what a store may tell a worker, and the wait a wakeup cuts short
   compaction.ts   folding a settled history prefix into a snapshot replay indexes
   view.ts         a run rendered for an admin screen: blockedOn + history as a
@@ -925,12 +939,12 @@ CI runs the full suite, Postgres included, on every push.
   every row's chain to decide whether to show it, against an index that orders
   runs and knows nothing about generations. A tag names every generation at
   once, which is how to get a chain's runs back in one query.
-- **Retagging a run, and matching several tags at once.** `engine.start` is the
-  only place tags are set and `engine.list` takes one tag, not a set. Tags are
+- **Retagging a run.** `engine.start` is the only place tags are set. Tags are
   the run's identity in the application's terms, which does not change while it
   runs; a mutable set of them is a labelling system, with a second write path
-  into the index and a question about what a tag meant at the time. Narrow a
-  tag query further with `workflow` and `status`, or filter the page.
+  into the index and a question about what a tag meant at the time. A query may
+  name several tags at once, which is the half of this that reads rather than
+  writes.
 - **Continuing a run from outside it.** `ctx.continueAsNew` is a decision the
   workflow makes about its own state, and only the workflow knows what the next
   generation needs to be handed. There is no `engine.continueAsNew`; cancelling
