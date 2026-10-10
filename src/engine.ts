@@ -18,7 +18,7 @@ import { DEFAULT_RETRY } from "./retry.js";
 import { compensatedError, runCompensations } from "./saga.js";
 import { type ScheduleOptions, type ScheduledRun, schedulePeriod, scheduleRunId } from "./schedule.js";
 import { type SignalDefinition, SignalRegistry, recordRejection, signalName } from "./signals.js";
-import { normalizeTags } from "./tags.js";
+import { normalizeTags, sameTags } from "./tags.js";
 import type { ChildHandle, RetryPolicy, RunPage, RunQuery, RunRecord, RunStore, WorkflowDefinition } from "./types.js";
 import { type ChainView, type RunView, renderChain, renderRun } from "./view.js";
 import { WorkflowRegistry, runVersion } from "./versions.js";
@@ -320,6 +320,40 @@ export class Engine {
     await this.persist(run);
     await this.announce(run);
     await this.notifyParent(run);
+    return run;
+  }
+
+  /**
+   * Replace what a run is called in the application's own terms, and the index
+   * rows an operator finds it by. The set given replaces whatever the run
+   * carried; an empty one leaves it untagged. A run that has already finished
+   * can be renamed too: the names index the record, which outlives the run.
+   *
+   * Addressed the way `signal` and `cancel` are, because the tags belong to
+   * the work rather than to a record of it: this renames the generation doing
+   * the work, whichever id of the chain the caller is holding. The generations
+   * that have handed off keep the names they ran under, which is the only
+   * account of what the run was called at the time, and `viewChain` still
+   * reads the chain as one piece of work from any of them.
+   *
+   * Throws ConflictError if another writer moved the run in between, as the
+   * writes above it do. Nothing was written, so the call can be made again
+   * against the run as it then stands.
+   */
+  async retag(id: string, tags: readonly string[]): Promise<RunRecord> {
+    const next = normalizeTags(tags);
+    const run = await this.live(id);
+    // Retagging a run to the tags it already carries writes nothing: the index
+    // rows would be deleted and put back as they were, for a version bump that
+    // costs whatever worker is holding the run its pass.
+    if (sameTags(run.tags ?? [], next)) return run;
+
+    // Absent rather than empty, which is the shape an untagged run has always
+    // had, so nothing downstream gets a second way to read "no tags".
+    if (next.length === 0) delete run.tags;
+    else run.tags = next;
+    run.updatedAt = this.now();
+    if (!(await this.store.retag(run, run.version))) throw new ConflictError(run.id);
     return run;
   }
 

@@ -834,6 +834,108 @@ describe("tags", () => {
     expect((await engine.list({ tag: "order:4182" })).runs.map((r) => r.id)).toEqual(["r1~3", "r1~2", "r1"]);
   });
 
+  it("rewrites a run's tags, so an operator finds it under the name it now has", async () => {
+    const { engine } = harness([counter]);
+    await engine.start(counter, null, { id: "r1", tags: ["order:1", "tenant:acme"] });
+
+    // The order turned out to belong to another account.
+    const run = await engine.retag("r1", ["tenant:other", "order:1"]);
+
+    expect(run.tags).toEqual(["order:1", "tenant:other"]);
+    expect((await engine.get("r1"))?.tags).toEqual(["order:1", "tenant:other"]);
+    // The name it no longer carries stops answering for it, which is the half
+    // of a retag that a write to the record alone would not do.
+    expect((await engine.list({ tag: "tenant:acme" })).runs).toEqual([]);
+    expect((await engine.list({ tag: ["order:1", "tenant:other"] })).runs.map((r) => r.id)).toEqual(["r1"]);
+  });
+
+  it("leaves a run untagged when a retag names no tags at all", async () => {
+    const { engine } = harness([counter]);
+    await engine.start(counter, null, { id: "r1", tags: ["order:1"] });
+
+    await engine.retag("r1", []);
+
+    // Absent rather than empty: the shape an untagged run has always had, so
+    // no reader ends up with two ways to spell "no tags".
+    expect((await engine.get("r1"))?.tags).toBeUndefined();
+    expect((await engine.list({ tag: "order:1" })).runs).toEqual([]);
+    expect((await engine.list()).runs.map((r) => r.id)).toEqual(["r1"]);
+  });
+
+  it("refuses a tag it could not index, leaving the tags the run had", async () => {
+    const { engine } = harness([counter]);
+    await engine.start(counter, null, { id: "r1", tags: ["order:1"] });
+
+    await expect(engine.retag("r1", ["ok", "   "])).rejects.toThrow(/tag cannot be empty/);
+    await expect(engine.retag("r1", ["x".repeat(MAX_TAG_LENGTH + 1)])).rejects.toThrow(/is longer than/);
+    await expect(engine.retag("r1", Array.from({ length: MAX_TAGS + 1 }, (_, i) => `t${i}`))).rejects.toThrow(
+      /at most 16 tags/,
+    );
+
+    // Refused at the door, as at start: a retag that dropped the tag it could
+    // not index would leave the run under a name nobody can predict.
+    expect((await engine.get("r1"))?.tags).toEqual(["order:1"]);
+    expect((await engine.list({ tag: "order:1" })).runs.map((r) => r.id)).toEqual(["r1"]);
+  });
+
+  it("writes nothing when a retag names the tags the run already carries", async () => {
+    const { engine, advance } = harness([counter]);
+    await engine.start(counter, null, { id: "r1", tags: ["order:1", "tenant:acme"] });
+    const before = await engine.get("r1");
+    advance(1_000);
+
+    // Spelled differently, the same set: a write here would cost whatever
+    // worker is holding the run its pass, to rewrite an index into the state
+    // it was already in.
+    await engine.retag("r1", [" tenant:acme ", "order:1", "order:1"]);
+
+    const after = await engine.get("r1");
+    expect(after?.version).toBe(before?.version);
+    expect(after?.updatedAt).toBe(before?.updatedAt);
+    expect(after?.tags).toEqual(["order:1", "tenant:acme"]);
+  });
+
+  it("renames the generation doing the work, not the one that started the chain", async () => {
+    const batches = defineWorkflow<number, number>("batches", async (ctx, left) => {
+      await ctx.waitFor("go");
+      return left > 1 ? ctx.continueAsNew(left - 1) : left;
+    });
+    const { engine } = harness([batches]);
+    await engine.start(batches, 3, { id: "r1", tags: ["order:4182"] });
+    await engine.settle("r1");
+    await engine.signal("r1", "go");
+    expect((await engine.settle("r1")).id).toBe("r1~2");
+
+    // Addressed by the id the operator kept — the one they started — and
+    // applied to the generation that is actually waiting on the work.
+    await engine.retag("r1", ["order:4182", "tenant:acme"]);
+
+    expect((await engine.get("r1~2"))?.tags).toEqual(["order:4182", "tenant:acme"]);
+    // The generation that handed off keeps what it ran under, which is the
+    // only account of what the run was called at the time.
+    expect((await engine.get("r1"))?.tags).toEqual(["order:4182"]);
+    expect((await engine.list({ tag: "tenant:acme" })).runs.map((r) => r.id)).toEqual(["r1~2"]);
+
+    // And the generation after it inherits the names the live one now carries.
+    await engine.signal("r1", "go");
+    expect((await engine.settle("r1")).id).toBe("r1~3");
+    expect((await engine.get("r1~3"))?.tags).toEqual(["order:4182", "tenant:acme"]);
+    expect((await engine.list({ tag: "tenant:acme" })).runs.map((r) => r.id)).toEqual(["r1~3", "r1~2"]);
+  });
+
+  it("renames a run that has already finished", async () => {
+    const { engine } = harness([counter]);
+    await engine.start(counter, null, { id: "r1", tags: ["order:1"] });
+    expect((await engine.settle("r1")).status).toBe("completed");
+
+    // The names index the record, which outlives the run: a run mislabelled
+    // while it ran is still the one an operator goes looking for afterwards.
+    await engine.retag("r1", ["order:4182"]);
+
+    expect((await engine.list({ tag: "order:4182" })).runs.map((r) => r.id)).toEqual(["r1"]);
+    expect((await engine.list({ tag: "order:1" })).runs).toEqual([]);
+  });
+
   it("shows a found run's tags on its view", async () => {
     const { engine } = harness([counter]);
     await engine.start(counter, null, { id: "r1", tags: ["order:1"] });
