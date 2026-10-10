@@ -23,24 +23,41 @@ export function neverAborted(): AbortSignal {
  * down. So it is deliberately not durable either — nothing about it survives a
  * restart, because a restart already ends the attempt it was bounding.
  *
- * Nothing cancels `fn`. A promise cannot be interrupted, so the work is
- * abandoned rather than stopped: it may still finish, and whatever it touched on
- * the way is a side effect the retry will produce again. That is the exposure a
- * lease expiry already has — the difference is that the retry is now recorded,
- * counted against the step's policy, and taken by the worker that still holds
- * the run.
+ * A promise cannot be interrupted, so the attempt is abandoned rather than
+ * stopped — but `fn` is given an `AbortSignal` that is aborted when the bound
+ * elapses, which is the one thing that can reach the work from here. A
+ * cooperating client (`fetch`, a driver that takes a signal, anything that
+ * watches one) therefore stops with the attempt instead of carrying on against
+ * a result nobody will read. A step that ignores the signal is exactly where it
+ * was: the work may still finish, and whatever it touched on the way is a side
+ * effect the retry will produce again — which is why a step with a timeout
+ * wants the same idempotency key a step that retries wants.
  */
 export async function withTimeout<T>(name: string, timeoutMs: number, fn: StepFn<T>): Promise<T> {
+  // One controller per call, so the signal's life is this attempt's: a retry
+  // comes back through here and gets a fresh one rather than one already spent.
+  const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
       // Called inside the race so a synchronous throw rejects here rather than
       // escaping past the timer that would otherwise be left running.
-      (async () => fn(neverAborted()))(),
+      (async () => fn(controller.signal))(),
       new Promise<never>((_, reject) => {
         // Not unref'd: if the step never answers, this timer is the only thing
         // left that will move the run on.
-        timer = setTimeout(() => reject(new StepTimeoutError(name, timeoutMs)), timeoutMs);
+        timer = setTimeout(() => {
+          const timedOut = new StepTimeoutError(name, timeoutMs);
+          // Reject before aborting. A cancelled client rejects with the reason
+          // it was aborted with, and the race reports whichever settles first;
+          // rejecting first makes that this error every time, so the attempt
+          // records the bound it ran past rather than whatever the client made
+          // of being cancelled — or nothing at all, from a step that ignores
+          // the signal. The abort still reaches the work: race has already
+          // settled, but nothing here depends on that promise again.
+          reject(timedOut);
+          controller.abort(timedOut);
+        }, timeoutMs);
       }),
     ]);
   } finally {
