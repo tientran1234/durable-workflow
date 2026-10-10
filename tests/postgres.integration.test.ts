@@ -204,6 +204,50 @@ describe.skipIf(!url)("PostgresStore", () => {
     }
   });
 
+  it("rewrites a run's tag index in one transaction, keeping the place the run was created in", async () => {
+    let now = T0;
+    const engine = new Engine({ store, workflows: [wf], now: () => now });
+    await engine.start(wf, { n: 1 }, { id: "early", tags: ["order:1"] });
+    now += 1_000;
+    await engine.start(wf, { n: 1 }, { id: "late", tags: ["order:2", "tenant:acme"] });
+    now += 1_000;
+
+    const run = (await store.get("early"))!;
+    // What engine.retag hands the store: the record as the retag leaves it,
+    // which moves updatedAt. The index rows still have to carry createdAt.
+    run.updatedAt = now;
+    // One tag kept and one replaced: the kept tag is the row the delete and the
+    // insert both name, which is why this is a transaction and not one
+    // statement with CTEs over a single snapshot.
+    run.tags = ["order:2", "tenant:acme"];
+    expect(await store.retag(run, run.version)).toBe(true);
+
+    expect((await engine.list({ tag: "order:1" })).runs).toEqual([]);
+    expect((await store.get("early"))?.tags).toEqual(["order:2", "tenant:acme"]);
+    // Created first, so it lists second. An index row stamped with the time of
+    // the retag — the obvious thing for a write to carry — would have put it
+    // above the run that was started after it.
+    expect((await engine.list({ tag: "order:2" })).runs.map((r) => r.id)).toEqual(["late", "early"]);
+    expect((await engine.list({ tag: ["order:2", "tenant:acme"] })).runs.map((r) => r.id)).toEqual(["late", "early"]);
+  });
+
+  it("rejects a stale retag, leaving the record and the index as they were", async () => {
+    const engine = new Engine({ store, workflows: [wf], now: () => T0 });
+    await engine.start(wf, { n: 1 }, { id: "r1", tags: ["order:1"] });
+    const stale = (await store.get("r1"))!;
+    await store.save((await store.get("r1"))!, stale.version);
+
+    stale.tags = ["order:2"];
+    expect(await store.retag(stale, stale.version)).toBe(false);
+
+    // Refused as one write: a run the index answers under the new tag while
+    // its record still carries the old one is the half-applied retag the
+    // transaction is there to rule out.
+    expect((await store.get("r1"))?.tags).toEqual(["order:1"]);
+    expect((await engine.list({ tag: "order:2" })).runs).toEqual([]);
+    expect((await engine.list({ tag: "order:1" })).runs.map((r) => r.id)).toEqual(["r1"]);
+  });
+
   it("hydrates listed runs from the same columns as get()", async () => {
     const engine = new Engine({ store, workflows: [wf], now: () => T0 });
     const id = await engine.start(wf, { n: 21 });

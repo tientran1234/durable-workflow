@@ -24,3 +24,4 @@ Same rule: one item per change, in order.
 - [x] A view over a whole continuation chain: `engine.viewChain(id)` answers from any id in the chain, with every generation's view and their timelines on one axis.
 - [x] Matching several tags at once: `engine.list({ tag: [...] })` returns the runs carrying every tag in the set, answered from the same index both durable stores already keep.
 - [x] Cancelling the work a step timeout abandoned: the step's `fn` is handed an `AbortSignal` that is aborted when `timeoutMs` elapses, so a cooperating client stops with the attempt.
+- [ ] Retagging a run: `engine.retag(id, tags)` replaces a run's tags and the index rows behind them in one transaction, addressed at the generation doing the work the way `signal` and `cancel` are.

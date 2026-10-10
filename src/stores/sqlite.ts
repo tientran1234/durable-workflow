@@ -108,28 +108,37 @@ export class SqliteStore implements RunStore {
     return row ? this.hydrate(row) : null;
   }
 
-  /** The tag table is not written here: tags are fixed at create. See tags.ts. */
+  /** The tag table is not written here: only a retag moves a run's tags. See tags.ts. */
   async save(run: RunRecord, expectedVersion: number): Promise<boolean> {
-    const next = expectedVersion + 1;
-    const { changes } = this.db
-      .prepare(
-        `UPDATE ${this.table}
-            SET data = @data, status = @status, wake_at = @wakeAt, lease_until = @leaseUntil,
-                version = @version, updated_at = @updatedAt
-          WHERE id = @id AND version = @expected`,
-      )
-      .run({
-        id: run.id,
-        data: JSON.stringify({ ...run, version: next }),
-        status: run.status,
-        wakeAt: run.wakeAt,
-        leaseUntil: run.leaseUntil,
-        version: next,
-        updatedAt: run.updatedAt,
-        expected: expectedVersion,
-      });
-    if (changes !== 1) return false;
-    run.version = next;
+    if (!this.updateRecord(run, expectedVersion)) return false;
+    run.version = expectedVersion + 1;
+    return true;
+  }
+
+  /**
+   * The record and its index rows in one transaction, for the reason `create`
+   * writes them in one: a run indexed under a name it no longer carries is one
+   * an operator reaches by the stale name and misses by the current one.
+   *
+   * The rows are rewritten wholesale rather than diffed against what was
+   * there. The set is at most MAX_TAGS rows for one run under a primary key,
+   * and working out which of them to keep would be two statements to save a
+   * handful of writes inside a transaction that already holds the row.
+   */
+  async retag(run: RunRecord, expectedVersion: number): Promise<boolean> {
+    const clear = this.db.prepare(`DELETE FROM ${this.tagTable} WHERE run_id = ?`);
+    const insertTag = this.db.prepare(
+      `INSERT INTO ${this.tagTable} (tag, run_id, created_at) VALUES (?, ?, ?)`,
+    );
+    const written = this.db.transaction(() => {
+      if (!this.updateRecord(run, expectedVersion)) return false;
+      clear.run(run.id);
+      // The run's createdAt, not now: see RunStore.retag.
+      for (const tag of run.tags ?? []) insertTag.run(tag, run.id, run.createdAt);
+      return true;
+    })();
+    if (!written) return false;
+    run.version = expectedVersion + 1;
     return true;
   }
 
@@ -225,6 +234,33 @@ export class SqliteStore implements RunStore {
     const runs = rows.slice(0, limit).map((row) => this.hydrate(row));
     const last = runs[runs.length - 1];
     return { runs, cursor: rows.length > limit && last ? encodeCursor(last) : null };
+  }
+
+  /**
+   * The version-guarded UPDATE of the record itself, which `save` is and
+   * `retag` runs inside its transaction. Shared so the two cannot drift into
+   * writing a run's columns differently.
+   */
+  private updateRecord(run: RunRecord, expectedVersion: number): boolean {
+    const version = expectedVersion + 1;
+    const { changes } = this.db
+      .prepare(
+        `UPDATE ${this.table}
+            SET data = @data, status = @status, wake_at = @wakeAt, lease_until = @leaseUntil,
+                version = @version, updated_at = @updatedAt
+          WHERE id = @id AND version = @expected`,
+      )
+      .run({
+        id: run.id,
+        data: JSON.stringify({ ...run, version }),
+        status: run.status,
+        wakeAt: run.wakeAt,
+        leaseUntil: run.leaseUntil,
+        version,
+        updatedAt: run.updatedAt,
+        expected: expectedVersion,
+      });
+    return changes === 1;
   }
 
   private hydrate(row: Row): RunRecord {

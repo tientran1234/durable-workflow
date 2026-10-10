@@ -25,6 +25,15 @@ export class MemoryStore implements RunStore {
     return true;
   }
 
+  /**
+   * A Map indexes nothing, so the record is the index and this is `save`. It is
+   * here because the contract is what a durable store has to do, and a store
+   * left without it would answer a tag query from an index nobody rewrote.
+   */
+  async retag(run: RunRecord, expectedVersion: number): Promise<boolean> {
+    return this.save(run, expectedVersion);
+  }
+
   async claimDue(now: number, leaseMs: number, limit: number): Promise<RunRecord[]> {
     const due = [...this.runs.values()]
       .filter((r) => isDue(r, now) && (r.leaseUntil === null || r.leaseUntil < now))

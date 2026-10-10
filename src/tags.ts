@@ -7,9 +7,10 @@ import type { RunRecord } from "./types.js";
  * so `engine.list({ tag })` answers "which run is handling this" without the
  * caller having kept the id and without a scan over every run.
  *
- * Tags are set once, by `engine.start`, and never change afterwards. They say
- * what the run is about, which is settled before the first step; a store is
- * therefore free to mirror them into an index at create and never look again.
+ * Tags are set by `engine.start` and rewritten only by `engine.retag`. Every
+ * other write a run makes leaves them where they were, which is why a store
+ * mirrors them into an index at create and revisits it in that one place
+ * rather than on every tick.
  */
 
 /**
@@ -22,7 +23,8 @@ export const MAX_TAGS = 16;
 export const MAX_TAG_LENGTH = 128;
 
 /**
- * The tags a run is created with: trimmed, deduplicated and sorted.
+ * The tags a run carries: trimmed, deduplicated and sorted. Applied where they
+ * are set — at start, and again where a retag replaces them.
  *
  * Sorted because the order tags were passed in is not information — it would
  * otherwise show up as a difference between two runs tagged the same way — and
@@ -56,6 +58,16 @@ export function queryTags(tag: string | readonly string[] | undefined): string[]
   if (typeof tag === "string") return [validTag(tag)];
   if (tag.length > MAX_TAGS) throw new Error(`a tag query may name at most ${MAX_TAGS} tags, got ${tag.length}`);
   return normalized(tag);
+}
+
+/**
+ * Are these the same tags? Both sides come out of `normalizeTags`, so sameness
+ * is element-wise: a retag to the tags a run already carries is a write worth
+ * not making, since it would delete index rows to put them back and bump the
+ * version under whatever worker holds the run.
+ */
+export function sameTags(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((tag, i) => tag === b[i]);
 }
 
 /** Does this run carry `tag`? For stores that filter in memory. */

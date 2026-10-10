@@ -1,4 +1,4 @@
-import type { Notification, Pool } from "pg";
+import type { Notification, Pool, PoolClient } from "pg";
 import { decodeCursor, encodeCursor, pageLimit } from "../list.js";
 import { queryTags } from "../tags.js";
 import type { RunPage, RunQuery, RunRecord, RunStore } from "../types.js";
@@ -41,8 +41,8 @@ export class PostgresStore implements RunStore, WakeupSource {
   /**
    * Where a run's tags are indexed: a row per (tag, run), carrying the run's
    * `created_at` so the index can hand a tag's runs over already in listing
-   * order. Both columns are fixed when the run is created, so the copy cannot
-   * drift from the record.
+   * order. Only `create` and `retag` write it, and each writes it with the
+   * record, so the copy cannot drift from the run.
    */
   private readonly tagTable: string;
   /** Where wakeups for this table are sent. Named after it, so two tables do not share them. */
@@ -133,19 +133,52 @@ export class PostgresStore implements RunStore, WakeupSource {
     return row ? this.hydrate(row) : null;
   }
 
-  /** The tag table is not written here: tags are fixed at create. See tags.ts. */
+  /** The tag table is not written here: only a retag moves a run's tags. See tags.ts. */
   async save(run: RunRecord, expectedVersion: number): Promise<boolean> {
-    const next = expectedVersion + 1;
-    const { rowCount } = await this.pool.query(
-      `UPDATE ${this.table}
-         SET data = $2::jsonb, status = $3, wake_at = $4, lease_until = $5, version = $6, updated_at = $7
-       WHERE id = $1 AND version = $8`,
-      [run.id, JSON.stringify({ ...run, version: next }), run.status, run.wakeAt, run.leaseUntil, next, run.updatedAt, expectedVersion],
-    );
-    if (rowCount !== 1) return false;
-    run.version = next;
+    if (!(await this.updateRecord(this.pool, run, expectedVersion))) return false;
+    run.version = expectedVersion + 1;
     await this.wake(run);
     return true;
+  }
+
+  /**
+   * The record and its index rows together, for the reason `create` writes
+   * them in one statement: a run indexed under a name it no longer carries is
+   * one an operator reaches by the stale name and misses by the current one.
+   *
+   * A transaction on one connection rather than that single statement, because
+   * this one deletes the rows before it writes them. Data-modifying CTEs all
+   * read the same snapshot, so an insert of a tag the run already had would
+   * collide on `(tag, run_id)` with the row the delete in the same statement
+   * had removed — a retag refused for leaving a tag alone.
+   *
+   * No wakeup is sent: a retag touches neither the status nor the wake time,
+   * so it cannot leave a run claimable that the write before it did not.
+   */
+  async retag(run: RunRecord, expectedVersion: number): Promise<boolean> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const written = await this.updateRecord(client, run, expectedVersion);
+      if (written) {
+        await client.query(`DELETE FROM ${this.tagTable} WHERE run_id = $1`, [run.id]);
+        // The run's created_at, not now: see RunStore.retag.
+        await client.query(
+          `INSERT INTO ${this.tagTable} (tag, run_id, created_at)
+           SELECT tag, $1, $2 FROM unnest($3::text[]) AS tag`,
+          [run.id, run.createdAt, run.tags ?? []],
+        );
+      }
+      await client.query(written ? "COMMIT" : "ROLLBACK");
+      client.release();
+      if (written) run.version = expectedVersion + 1;
+      return written;
+    } catch (err) {
+      // The transaction is open and the session is in whatever state the
+      // failure left it: give the connection up rather than hand it back.
+      client.release(true);
+      throw err;
+    }
   }
 
   /**
@@ -305,6 +338,22 @@ export class PostgresStore implements RunStore, WakeupSource {
     const wakeup = wakeupFor(run);
     if (wakeup === null) return;
     await this.pool.query("SELECT pg_notify($1, $2)", [this.channel, encodeWakeup(wakeup)]);
+  }
+
+  /**
+   * The version-guarded UPDATE of the record itself, which `save` is and
+   * `retag` runs on its own connection inside a transaction. Shared so the two
+   * cannot drift into writing a run's columns differently.
+   */
+  private async updateRecord(q: Pool | PoolClient, run: RunRecord, expectedVersion: number): Promise<boolean> {
+    const version = expectedVersion + 1;
+    const { rowCount } = await q.query(
+      `UPDATE ${this.table}
+         SET data = $2::jsonb, status = $3, wake_at = $4, lease_until = $5, version = $6, updated_at = $7
+       WHERE id = $1 AND version = $8`,
+      [run.id, JSON.stringify({ ...run, version }), run.status, run.wakeAt, run.leaseUntil, version, run.updatedAt, expectedVersion],
+    );
+    return rowCount === 1;
   }
 
   /** One LISTENing session, with the handlers that give it up when it breaks. */

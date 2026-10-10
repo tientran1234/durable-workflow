@@ -97,9 +97,9 @@ export interface RunRecord {
   snapshot?: HistorySnapshot;
   /**
    * What this run is about, in the application's own names — an order id, a
-   * tenant — set at start and immutable after it. Indexed by every store, so
-   * `engine.list({ tag })` finds the run without its id. Absent when the run
-   * was started without any, which is most runs.
+   * tenant — set at start and rewritten only by `engine.retag`. Indexed by
+   * every store, so `engine.list({ tag })` finds the run without its id.
+   * Absent when the run carries none, which is most runs.
    */
   tags?: string[];
   /** Signals that arrived before the workflow reached the matching waitFor. */
@@ -299,6 +299,23 @@ export interface RunStore {
    * On success the store bumps `run.version`. Returns false on conflict.
    */
   save(run: RunRecord, expectedVersion: number): Promise<boolean>;
+  /**
+   * Persist `run` with the tags it now carries, under the same version check
+   * as `save`, and bring the tag index to match it. Returns false on conflict.
+   *
+   * A write of its own because `save` deliberately leaves the index alone:
+   * every other change a run makes — a step, a timer, a signal — leaves its
+   * tags where they were, and a store re-syncing the index on each of them
+   * would pay for the index on every tick. Here the record and the index rows
+   * have to land together: a run indexed under a name it no longer carries is
+   * one an operator reaches by a stale name and misses by the current one.
+   *
+   * The index rows take the run's `createdAt`, not the time of this write. The
+   * index supplies the listing order, so a row stamped now would put the run
+   * at the top of its new tag's page while every other listing kept it where
+   * it was created.
+   */
+  retag(run: RunRecord, expectedVersion: number): Promise<boolean>;
   /**
    * Atomically lease up to `limit` runs that are due at `now` and not held by
    * another worker. Leased runs come back with `leaseUntil` and `version` updated.
