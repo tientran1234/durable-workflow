@@ -2223,6 +2223,15 @@ describe("step timeouts", () => {
    */
   const hang = () => new Promise<never>(() => {});
 
+  /**
+   * A hang that answers an abort, as a client handed an `AbortSignal` does: it
+   * rejects with the reason the attempt was aborted with and lets go.
+   */
+  const hangUntilAborted = (signal: AbortSignal) =>
+    new Promise<never>((_, reject) => {
+      signal.addEventListener("abort", () => reject(signal.reason as Error));
+    });
+
   it("turns a hung attempt into a retryable failure with an event of its own", async () => {
     let attempts = 0;
     const wf = defineWorkflow<null, string>("fetch", async (ctx) =>
@@ -2316,5 +2325,119 @@ describe("step timeouts", () => {
       'step "ship" failed after 1 attempt(s): no courier; compensation did not complete: "refund" (timed out after 20ms)',
     );
     expect(run.history.map((e) => e.type)).toEqual(["step.completed", "step.failed", "compensation.failed"]);
+  });
+
+  it("aborts the attempt's signal when the bound elapses, with the timeout as the reason", async () => {
+    let reason: unknown;
+    const wf = defineWorkflow<null, void>("cancelling", async (ctx) => {
+      await ctx.step(
+        "call-api",
+        (signal) =>
+          new Promise<never>((_, reject) => {
+            signal.addEventListener("abort", () => {
+              reason = signal.reason;
+              reject(signal.reason as Error);
+            });
+          }),
+        { timeoutMs: 20, retry: { maxAttempts: 1 } },
+      );
+    });
+    const { engine } = harness([wf]);
+    const id = await engine.start(wf, null);
+    const run = await engine.settle(id);
+
+    expect(reason).toBeInstanceOf(StepTimeoutError);
+    expect((reason as StepTimeoutError).timeoutMs).toBe(20);
+    // The abort is what the step sees; what the run records is still the bound
+    // it ran past, not whatever the cancelled client rejected with.
+    expect(run.error).toBe('step "call-api" failed after 1 attempt(s): timed out after 20ms');
+  });
+
+  it("gives each attempt a signal of its own, so a retry is not born aborted", async () => {
+    const seen: boolean[] = [];
+    let attempts = 0;
+    const wf = defineWorkflow<null, string>("fetch", async (ctx) =>
+      ctx.step(
+        "call-api",
+        (signal) => {
+          seen.push(signal.aborted);
+          return ++attempts === 1 ? hangUntilAborted(signal) : "ok";
+        },
+        { timeoutMs: 20 },
+      ),
+    );
+    const { engine, advance } = harness([wf]);
+    const id = await engine.start(wf, null);
+
+    await engine.settle(id);
+    advance(1_000);
+    const run = await engine.settle(id);
+
+    expect(seen).toEqual([false, false]);
+    expect(run.status).toBe("completed");
+    expect(run.output).toBe("ok");
+  });
+
+  it("leaves the signal alone when the attempt answers in time", async () => {
+    let aborted: boolean | undefined;
+    const wf = defineWorkflow<null, string>("quick", async (ctx) => {
+      const signal = await ctx.step("call-api", (s) => Promise.resolve(s), { timeoutMs: 60_000 });
+      aborted = signal.aborted;
+      return "ok";
+    });
+    const { engine } = harness([wf]);
+    const id = await engine.start(wf, null);
+    const run = await engine.settle(id);
+
+    expect(run.status).toBe("completed");
+    expect(aborted).toBe(false);
+  });
+
+  it("hands a step with no bound a signal that nothing ever aborts", async () => {
+    let signal: AbortSignal | undefined;
+    const wf = defineWorkflow<null, void>("unbounded", async (ctx) => {
+      await ctx.step("call-api", (s) => {
+        signal = s;
+      });
+      await ctx.step("wait", () => "done");
+    });
+    const { engine } = harness([wf]);
+    const id = await engine.start(wf, null);
+    await engine.settle(id);
+
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect(signal?.aborted).toBe(false);
+  });
+
+  it("aborts a hung undo too, so the phase does not leave it running", async () => {
+    let reason: unknown;
+    const wf = defineWorkflow<null, void>("checkout", async (ctx) => {
+      await ctx.step("charge", () => "ok");
+      ctx.compensate(
+        "refund",
+        (signal) => {
+          signal.addEventListener("abort", () => {
+            reason = signal.reason;
+          });
+          return hangUntilAborted(signal);
+        },
+        { timeoutMs: 20, retry: { maxAttempts: 1 } },
+      );
+      await ctx.step(
+        "ship",
+        () => {
+          throw new Error("no courier");
+        },
+        { retry: { maxAttempts: 1 } },
+      );
+    });
+    const { engine } = harness([wf]);
+    const id = await engine.start(wf, null);
+    const run = await engine.settle(id);
+
+    expect(reason).toBeInstanceOf(StepTimeoutError);
+    expect(run.error).toBe(
+      'step "ship" failed after 1 attempt(s): no courier; compensation did not complete: "refund" (timed out after 20ms)',
+    );
   });
 });

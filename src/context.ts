@@ -12,7 +12,7 @@ import {
 import { type LifecycleHooks, notify, runEvent } from "./hooks.js";
 import { DEFAULT_RETRY, backoffMs } from "./retry.js";
 import { type SignalDefinition, signalName } from "./signals.js";
-import { withTimeout } from "./timeout.js";
+import { neverAborted, withTimeout } from "./timeout.js";
 import type {
   ChildHandle,
   ChildOutcome,
@@ -21,6 +21,7 @@ import type {
   NewEvent,
   RetryPolicy,
   RunRecord,
+  StepFn,
   StepOptions,
   WorkflowContext,
   WorkflowDefinition,
@@ -164,7 +165,7 @@ export function createContext<Input>(run: RunRecord, deps: ContextDeps): ReplayC
     kind: DurableKind,
     c: number,
     name: string,
-    fn: () => Promise<T> | T,
+    fn: StepFn<T>,
     options: StepOptions | undefined,
   ): Promise<T> => {
     const completed = at(c, [COMPLETED[kind]])[0];
@@ -192,7 +193,8 @@ export function createContext<Input>(run: RunRecord, deps: ContextDeps): ReplayC
       const timeoutMs = options?.timeoutMs;
       // The bound is per attempt, not per step: the retries below are a
       // succession of attempts, and each gets the whole of it.
-      const result = timeoutMs === undefined ? await fn() : await withTimeout(name, timeoutMs, fn);
+      const result =
+        timeoutMs === undefined ? await fn(neverAborted()) : await withTimeout(name, timeoutMs, fn);
       push(completedEvent(kind, c, name, result));
       await deps.persist(run);
       return result;
@@ -237,11 +239,11 @@ export function createContext<Input>(run: RunRecord, deps: ContextDeps): ReplayC
       return compensations;
     },
 
-    async step<T>(name: string, fn: () => Promise<T> | T, options?: StepOptions): Promise<T> {
+    async step<T>(name: string, fn: StepFn<T>, options?: StepOptions): Promise<T> {
       return runDurable("step", call++, name, fn, options);
     },
 
-    compensate(name: string, fn: () => Promise<unknown> | unknown, options?: StepOptions): void {
+    compensate(name: string, fn: StepFn<unknown>, options?: StepOptions): void {
       // No call position and no event. Registering decides nothing, so there is
       // nothing for a later replay to read back — and a position that never got
       // an event of its own would stop compaction folding past it for the rest

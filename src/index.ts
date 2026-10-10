@@ -15,6 +15,7 @@ export type {
   RunRecord,
   RunStatus,
   RunStore,
+  StepFn,
   StepOptions,
   WorkflowContext,
   WorkflowDefinition,

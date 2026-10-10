@@ -129,12 +129,24 @@ export interface RetryPolicy {
   maxDelayMs: number;
 }
 
+/**
+ * A step's body, or an undo's.
+ *
+ * The signal is aborted when the attempt's `timeoutMs` elapses, so a client
+ * that takes one is cancelled instead of being left running against work the
+ * engine has already written off. A step with no `timeoutMs` is handed a signal
+ * all the same — one nothing ever aborts — so `fn` is written the once and
+ * putting a bound on it later changes only the options.
+ */
+export type StepFn<T> = (signal: AbortSignal) => Promise<T> | T;
+
 export interface StepOptions {
   retry?: Partial<RetryPolicy>;
   /**
    * Wall-clock bound on one attempt. An attempt still running after this long
    * is abandoned and recorded as a failed attempt, retried under `retry` like
-   * any other failure.
+   * any other failure, and its `AbortSignal` is aborted so a client that
+   * watches one stops with it.
    *
    * Unbounded by default, which is the only shape a hang has without it: the
    * worker sits in the step holding its lease, and when the lease expires
@@ -151,7 +163,7 @@ export interface StepOptions {
  */
 export interface Compensation {
   name: string;
-  fn: () => Promise<unknown> | unknown;
+  fn: StepFn<unknown>;
   options?: StepOptions;
 }
 
@@ -182,9 +194,10 @@ export interface WorkflowContext<Input> {
    * stored result without calling `fn`. Results must be JSON-serialisable.
    *
    * `timeoutMs` bounds one attempt rather than the step: a call that hangs
-   * fails that attempt and retries under the step's own policy.
+   * fails that attempt and retries under the step's own policy, and the signal
+   * `fn` is given is aborted when that happens.
    */
-  step<T>(name: string, fn: () => Promise<T> | T, options?: StepOptions): Promise<T>;
+  step<T>(name: string, fn: StepFn<T>, options?: StepOptions): Promise<T>;
   /**
    * Register an undo for what was just done — the step above this call. If the
    * run goes on to fail, every undo registered by then runs, newest first, each
@@ -195,7 +208,7 @@ export interface WorkflowContext<Input> {
    * reached. It therefore does not suspend, which is why it returns nothing to
    * await.
    */
-  compensate(name: string, fn: () => Promise<unknown> | unknown, options?: StepOptions): void;
+  compensate(name: string, fn: StepFn<unknown>, options?: StepOptions): void;
   /**
    * Suspend until `engine.signal(runId, signal, payload)` — or until
    * `timeoutMs`, which throws WaitTimeoutError.

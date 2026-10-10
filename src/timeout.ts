@@ -1,4 +1,16 @@
 import { StepTimeoutError } from "./errors.js";
+import type { StepFn } from "./types.js";
+
+/**
+ * The signal handed to an attempt that has no `timeoutMs`: nothing aborts it.
+ *
+ * A fresh controller per attempt rather than one shared signal, because a step
+ * that registers an abort listener would otherwise pile its listeners onto a
+ * value that outlives every run in the process.
+ */
+export function neverAborted(): AbortSignal {
+  return new AbortController().signal;
+}
 
 /**
  * Run `fn` with a wall-clock bound on this attempt, raising StepTimeoutError if
@@ -18,13 +30,13 @@ import { StepTimeoutError } from "./errors.js";
  * counted against the step's policy, and taken by the worker that still holds
  * the run.
  */
-export async function withTimeout<T>(name: string, timeoutMs: number, fn: () => Promise<T> | T): Promise<T> {
+export async function withTimeout<T>(name: string, timeoutMs: number, fn: StepFn<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
       // Called inside the race so a synchronous throw rejects here rather than
       // escaping past the timer that would otherwise be left running.
-      (async () => fn())(),
+      (async () => fn(neverAborted()))(),
       new Promise<never>((_, reject) => {
         // Not unref'd: if the step never answers, this timer is the only thing
         // left that will move the run on.
