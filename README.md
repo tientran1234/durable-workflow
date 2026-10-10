@@ -458,11 +458,13 @@ application's — order 4182 — so tag the run with it at start and find it by
 that later.
 
 ```ts
-await engine.start(fulfilment, { orderId: "ord_4182" }, { tags: ["order:ord_4182", "tenant:acme"] });
+const runId = await engine.start(fulfilment, { orderId: "ord_4182" }, { tags: ["order:ord_4182", "tenant:acme"] });
 
 const { runs } = await engine.list({ tag: "order:ord_4182" });     // which run is handling this?
 await engine.list({ tag: "tenant:acme", status: "waiting", limit: 20 });   // and what is stuck
 await engine.list({ tag: ["tenant:acme", "order:ord_4182"] });     // the run that is both
+
+await engine.retag(runId, ["order:ord_4182", "tenant:other"]);   // raised against the wrong account
 ```
 
 A tag query narrows alongside `workflow` and `status` and pages by the same
@@ -477,25 +479,42 @@ from filters the operator left blank means. A set is trimmed, deduplicated and
 order-insensitive like a run's own tags, so `["b", " a "]` and `["a", "b"]` are
 the same query.
 
-Tags are fixed when the run starts. They say what the run is about, which is
-settled before the first step, and both durable stores mirror them into an
-index at that point and never have to revisit it. The index is keyed
-`(tag, created_at DESC, run_id DESC)` — the tag, then the order listings come
-out in — so a tag query seeks once and reads the page it returns, whether the
-tag matches one run or a million. A set of tags enters the table the same way,
-through one of them, and tests the rest as a key probe per row the seek already
-named: the page still arrives in listing order and the query still stops at
-`limit`, where intersecting every tag's runs would mean collecting and sorting
-all of them before a page could be ordered at all. Tags also follow
-`ctx.continueAsNew` into the next generation, since the chain is one piece of work under one set of names; a
-child run is its own work and starts untagged.
+Tags are set at start and rewritten only by `engine.retag`. Every other write
+a run makes leaves them where they were, so both durable stores mirror them
+into an index at create and revisit it in that one place rather than on every
+tick. The index is keyed `(tag, created_at DESC, run_id DESC)` — the tag, then
+the order listings come out in — so a tag query seeks once and reads the page
+it returns, whether the tag matches one run or a million. A set of tags enters
+the table the same way, through one of them, and tests the rest as a key probe
+per row the seek already named: the page still arrives in listing order and
+the query still stops at `limit`, where intersecting every tag's runs would
+mean collecting and sorting all of them before a page could be ordered at all.
+Tags also follow `ctx.continueAsNew` into the next generation, since the chain
+is one piece of work under one set of names; a child run is its own work and
+starts untagged.
 
-A tag that could not be indexed is refused at `engine.start` rather than
-dropped: empty, longer than 128 characters, or more than 16 on one run. The
-failure mode worth avoiding is an operator searching for a run they cannot
-find. Duplicates collapse, and whitespace around a tag is trimmed both
-where it is stored and where it is matched, so `" order:1 "` and `"order:1"`
-are the same tag.
+`engine.retag(id, tags)` replaces the set: the tags passed are what the run
+carries afterwards, and an empty set leaves it with none. The record and the
+index rows move together in one transaction, because a run indexed under a
+name it no longer carries is one an operator reaches by the stale name and
+misses by the current one, and the new rows keep the run's `created_at` so a
+renamed run holds the place it was created in on its new tag's page rather
+than jumping to the top of it. A retag is addressed the way `signal` and
+`cancel` are — the names belong to the work, so it reaches the generation
+doing the work from whichever id of the chain you kept, and the generations
+that have already handed off keep what they ran under. Retagging a run to the
+tags it already carries writes nothing, so a caller reconciling tags on a
+schedule costs a worker holding the run nothing; a retag that races another
+writer throws `ConflictError` having written nothing, like every other write
+here. A run that has finished can be renamed too, since the names index the
+record, which outlives the run.
+
+A tag that could not be indexed is refused at `engine.start` and at
+`engine.retag` rather than dropped: empty, longer than 128 characters, or more
+than 16 on one run. The failure mode worth avoiding is an operator searching
+for a run they cannot find. Duplicates collapse, and whitespace around a tag
+is trimmed both where it is stored and where it is matched, so `" order:1 "`
+and `"order:1"` are the same tag.
 
 ## Dashboard
 
@@ -880,14 +899,15 @@ sees the leases it took. The cost is the other side of the same coin — writers
 queue rather than proceed in parallel, which is why a busy timeout is set and
 why many workers still want Postgres.
 
-Any `RunStore` implementation with `create / get / save(version) / claimDue /
-list` works. `save` must be conditional on `version`, `claimDue` must lease
-atomically, `list` must order by `(createdAt, id)` descending, and a
-`list({ tag })` must be answered from an index rather than by reading runs,
-one tag or a set of them — that is the whole contract. A `watch` on top of it
-makes the store a `WakeupSource`; see **Event-driven wakeups** for what a
-worker does with one, and for why it is latency rather than part of the
-contract.
+Any `RunStore` implementation with `create / get / save(version) /
+retag(version) / claimDue / list` works. `save` must be conditional on
+`version` and `retag` on the same, writing the record and the tag index in one
+transaction, `claimDue` must lease atomically, `list` must order by
+`(createdAt, id)` descending, and a `list({ tag })` must be answered from an
+index rather than by reading runs, one tag or a set of them — that is the
+whole contract. A `watch` on top of it makes the store a `WakeupSource`; see
+**Event-driven wakeups** for what a worker does with one, and for why it is
+latency rather than part of the contract.
 
 ## Layout
 
@@ -960,12 +980,14 @@ CI runs the full suite, Postgres included, on every push.
   every row's chain to decide whether to show it, against an index that orders
   runs and knows nothing about generations. A tag names every generation at
   once, which is how to get a chain's runs back in one query.
-- **Retagging a run.** `engine.start` is the only place tags are set. Tags are
-  the run's identity in the application's terms, which does not change while it
-  runs; a mutable set of them is a labelling system, with a second write path
-  into the index and a question about what a tag meant at the time. A query may
-  name several tags at once, which is the half of this that reads rather than
-  writes.
+- **The history of what a run was called.** `engine.retag` replaces a run's
+  tags; it does not keep the set it replaced, so a run found under
+  `order:4182` cannot say when it started carrying that name. Tags are an
+  index into the record, and keeping every set a run has ever had would be a
+  labelling system with an audit log attached — paid for on a write path that
+  exists to correct a mistake. The generations a continuation chain has handed
+  off do keep the names they ran under, which is the one part of this the
+  chain answers for nothing.
 - **Continuing a run from outside it.** `ctx.continueAsNew` is a decision the
   workflow makes about its own state, and only the workflow knows what the next
   generation needs to be handed. There is no `engine.continueAsNew`; cancelling

@@ -2,6 +2,8 @@
 
 ## 2026-10-10
 
+- Retagging a run: `engine.retag(id, tags)` replaces a run's tags and the index rows behind them in one transaction, so a run raised against the wrong tenant stops answering for the name it no longer carries and starts answering for the one it does — addressed at the generation doing the work the way `signal` and `cancel` are, with the index rows keeping the run's `created_at` so a rename does not move it to the top of its new tag's page, and the generations a chain has handed off keeping the names they ran under.
+
 - Cancelling the work a step timeout abandoned: a step's `fn` — and an undo's — is handed an `AbortSignal` that `withTimeout` aborts when the bound elapses, so a client that takes one stops with the attempt instead of running on against a result the engine has already written off, and the timer rejects before it aborts so the attempt still records the bound it ran past rather than whatever a cancelled client made of being cancelled; a promise is still not interruptible, so a step that ignores the signal is exactly where it was and still wants the idempotency key a step that retries wants.
 
 ## 2026-10-08
