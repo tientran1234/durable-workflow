@@ -86,6 +86,27 @@ The bound is per attempt, not per step, and it applies to an undo too — a
 `ctx.compensate` takes the same options, and a hung undo is the worse hang,
 since the run is already failing and the phase is waiting on it.
 
+A promise cannot be interrupted, so the attempt is abandoned rather than
+stopped — but `fn` is handed an `AbortSignal`, aborted when the bound elapses,
+which is the one thing that can reach the work from here:
+
+```ts
+await ctx.step("charge", (signal) => fetch(url, { signal }), { timeoutMs: 10_000 });
+```
+
+The abort's reason is the `StepTimeoutError`, so a client that rejects with what
+it was aborted with says why it stopped. What the run records is the bound it
+ran past either way: the attempt fails with `timed out after 10000ms` whatever a
+cancelled client made of being cancelled, or made of nothing, from a step that
+ignores the signal. A step that does ignore it is exactly where it was — the
+work may still finish, and the retry will do it a second time, which is why a
+step with a timeout wants the same idempotency key a step that retries wants.
+
+Every step gets a signal, bound or not; without a `timeoutMs` nothing ever
+aborts it. So `fn` is written the once, and putting a bound on it later changes
+only the options. Each attempt gets its own, so a retry does not start on a
+signal the attempt before it spent.
+
 **Keep it well under the engine's `leaseMs`** (30s by default). The timeout is
 what makes a hang the step's problem rather than the lease's; set it longer than
 the lease and the lease still expires first, which is the behaviour it was there
@@ -962,14 +983,12 @@ CI runs the full suite, Postgres included, on every push.
   old shape. Validating on the way out instead would put the engine in the
   position of failing a live run over a deploy it cannot see, which is what
   `version` is for.
-- **Cancelling the work a step timeout abandoned.** `timeoutMs` stops waiting
-  for the call; it cannot stop the call, because a promise is not interruptible
-  and nothing here is handed an `AbortSignal` to pass on. The abandoned work may
-  still finish, and the retry may do the same thing a second time — so a step
-  with a timeout wants the same idempotency key a step that retries already
-  wants. Threading cancellation through would mean a second signature for `fn`
-  and a cooperating client on the other end of it; the client's own request
-  timeout is that, where it exists.
+- **Stopping the work a step timeout abandoned, without the step's help.**
+  `timeoutMs` aborts the signal it handed `fn` — see Step timeouts — and that
+  is the whole of the reach it has. A promise is not interruptible, so a step
+  that does not watch the signal, or a client that takes none, runs on exactly
+  as before, and the retry may do the same thing a second time. Nothing here
+  can close that: the step's own idempotency key is what covers it.
 - **Authentication, and the CSRF token that goes with it.** `engine.dashboard()`
   serves whoever reaches it, and a cross-site form can post to it. Both belong
   to the layer you mount it behind: a token has to be bound to a session, and

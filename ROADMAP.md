@@ -23,3 +23,4 @@ Same rule: one item per change, in order.
 - [x] Dashboard: `engine.dashboard()` returns a single-file HTML handler (fetch-compatible) listing runs, rendering the timeline from `engine.view`, with a form to send a signal.
 - [x] A view over a whole continuation chain: `engine.viewChain(id)` answers from any id in the chain, with every generation's view and their timelines on one axis.
 - [x] Matching several tags at once: `engine.list({ tag: [...] })` returns the runs carrying every tag in the set, answered from the same index both durable stores already keep.
+- [x] Cancelling the work a step timeout abandoned: the step's `fn` is handed an `AbortSignal` that is aborted when `timeoutMs` elapses, so a cooperating client stops with the attempt.

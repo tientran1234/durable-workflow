@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-10
+
+- Cancelling the work a step timeout abandoned: a step's `fn` — and an undo's — is handed an `AbortSignal` that `withTimeout` aborts when the bound elapses, so a client that takes one stops with the attempt instead of running on against a result the engine has already written off, and the timer rejects before it aborts so the attempt still records the bound it ran past rather than whatever a cancelled client made of being cancelled; a promise is still not interruptible, so a step that ignores the signal is exactly where it was and still wants the idempotency key a step that retries wants.
+
 ## 2026-10-08
 
 - Matching several tags at once: `engine.list({ tag: [...] })` returns the runs carrying every tag in the set, answered from the same index both durable stores already keep — the set enters the table through one tag's range scan, so the page still arrives in listing order and still stops at `limit`, and the rest of the set is a key probe per row that seek already named, rather than an intersection the planner would have to collect and sort in full before it could order a page.
