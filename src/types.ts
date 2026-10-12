@@ -63,6 +63,24 @@ export interface RejectedSignal {
   at: number;
 }
 
+/**
+ * A set of tags a run used to carry, and the window it carried them in. Written
+ * by `engine.retag` for the set it replaced, so the names a run has answered to
+ * are on the record rather than only the one it answers to now.
+ *
+ * The window is recorded rather than derived, because the run keeps only the
+ * most recent of these: a reader deriving one set's start from the next oldest
+ * would, once the cap has dropped that one, read the gap as part of a window
+ * the run never carried.
+ */
+export interface FormerTags {
+  tags: string[];
+  /** When the run started carrying them: the retag before this one, or its start. */
+  from: number;
+  /** When they were replaced, which is when the set that replaced them took effect. */
+  until: number;
+}
+
 export interface RunRecord {
   id: string;
   workflow: string;
@@ -102,6 +120,11 @@ export interface RunRecord {
    * Absent when the run carries none, which is most runs.
    */
   tags?: string[];
+  /**
+   * The sets of tags `engine.retag` has replaced, newest first and capped at
+   * MAX_FORMER_TAGS. Absent until a run is retagged, which is most runs.
+   */
+  formerTags?: FormerTags[];
   /** Signals that arrived before the workflow reached the matching waitFor. */
   pendingSignals: Record<string, unknown[]>;
   /**

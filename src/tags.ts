@@ -1,4 +1,4 @@
-import type { RunRecord } from "./types.js";
+import type { FormerTags, RunRecord } from "./types.js";
 
 /**
  * A run id is the engine's name for a run; an operator arrives holding the
@@ -10,7 +10,9 @@ import type { RunRecord } from "./types.js";
  * Tags are set by `engine.start` and rewritten only by `engine.retag`. Every
  * other write a run makes leaves them where they were, which is why a store
  * mirrors them into an index at create and revisits it in that one place
- * rather than on every tick.
+ * rather than on every tick. That one place is also where the set being
+ * replaced goes onto the record, so an operator holding a name the index has
+ * stopped answering for still reaches the run that used to carry it.
  */
 
 /**
@@ -58,6 +60,36 @@ export function queryTags(tag: string | readonly string[] | undefined): string[]
   if (typeof tag === "string") return [validTag(tag)];
   if (tag.length > MAX_TAGS) throw new Error(`a tag query may name at most ${MAX_TAGS} tags, got ${tag.length}`);
   return normalized(tag);
+}
+
+/**
+ * How many of the sets a run has been retagged out of it keeps. A handful,
+ * because what the record is for is the rename an operator is holding the old
+ * name from — the one that happened this week, not the whole labelling career
+ * of a run something reconciles tags on in a loop.
+ */
+export const MAX_FORMER_TAGS = 10;
+
+/**
+ * When the run started carrying the tags it carries now: the retag that put
+ * them there, or its own start if it has never been retagged.
+ */
+export function tagsSince(run: Pick<RunRecord, "createdAt" | "formerTags">): number {
+  return run.formerTags?.[0]?.until ?? run.createdAt;
+}
+
+/**
+ * Record the set a retag is replacing, newest first, dropping the oldest past
+ * the cap. Called before the new tags go on, since the set it keeps and the
+ * window it keeps it under are both read off the run as it still stands.
+ *
+ * A run that carried nothing records the empty set rather than nothing at all:
+ * that entry is what says the name it carries now started at the retag instead
+ * of at the run, and the question this answers is when a name started.
+ */
+export function recordFormerTags(run: RunRecord, at: number): void {
+  const replaced: FormerTags = { tags: run.tags ?? [], from: tagsSince(run), until: at };
+  run.formerTags = [replaced, ...(run.formerTags ?? [])].slice(0, MAX_FORMER_TAGS);
 }
 
 /**

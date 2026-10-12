@@ -4,6 +4,7 @@ import {
   type ChildHandle,
   ConflictError,
   Engine,
+  MAX_FORMER_TAGS,
   MAX_REJECTED_SIGNALS,
   MAX_TAGS,
   MAX_TAG_LENGTH,
@@ -26,6 +27,7 @@ import {
   historyEvents,
   schedulePeriod,
   scheduleRunId,
+  tagsSince,
   wakeupFor,
 } from "../src/index.js";
 import { T0, harness, until } from "./helpers.js";
@@ -934,6 +936,116 @@ describe("tags", () => {
 
     expect((await engine.list({ tag: "order:4182" })).runs.map((r) => r.id)).toEqual(["r1"]);
     expect((await engine.list({ tag: "order:1" })).runs).toEqual([]);
+  });
+
+  it("keeps the set a retag replaced, with the window the run carried it in", async () => {
+    const { engine, advance } = harness([counter]);
+    await engine.start(counter, null, { id: "r1", tags: ["order:1"] });
+    advance(5_000);
+
+    await engine.retag("r1", ["order:4182"]);
+
+    // An operator arrives holding order:1, which now answers for nothing: the
+    // record is what says this is the run they mean, and since when it is not.
+    const run = await engine.get("r1");
+    expect(run?.formerTags).toEqual([{ tags: ["order:1"], from: T0, until: T0 + 5_000 }]);
+    expect(tagsSince(run!)).toBe(T0 + 5_000);
+  });
+
+  it("dates the current tags from the run itself until it is retagged", async () => {
+    const { engine } = harness([counter]);
+    await engine.start(counter, null, { id: "r1", tags: ["order:1"] });
+
+    const run = await engine.get("r1");
+    expect(run?.formerTags).toBeUndefined();
+    // Never renamed, so the names it carries are the ones it started with.
+    expect(tagsSince(run!)).toBe(T0);
+  });
+
+  it("stacks successive renames newest first, each window abutting the last", async () => {
+    const { engine, advance } = harness([counter]);
+    await engine.start(counter, null, { id: "r1", tags: ["tenant:acme"] });
+    advance(1_000);
+    await engine.retag("r1", ["tenant:beta"]);
+    advance(2_000);
+    await engine.retag("r1", ["tenant:gamma"]);
+
+    // One axis with no gaps in it: every moment of the run's life is covered
+    // by the set it was answering to then.
+    expect((await engine.get("r1"))?.formerTags).toEqual([
+      { tags: ["tenant:beta"], from: T0 + 1_000, until: T0 + 3_000 },
+      { tags: ["tenant:acme"], from: T0, until: T0 + 1_000 },
+    ]);
+  });
+
+  it("records the empty set when a run that carried no name is given one", async () => {
+    const { engine, advance } = harness([counter]);
+    await engine.start(counter, null, { id: "r1" });
+    advance(4_000);
+
+    await engine.retag("r1", ["order:4182"]);
+
+    // The entry looks like nothing and is the whole answer: without it the run
+    // would read as having carried order:4182 since it started.
+    const run = await engine.get("r1");
+    expect(run?.formerTags).toEqual([{ tags: [], from: T0, until: T0 + 4_000 }]);
+    expect(tagsSince(run!)).toBe(T0 + 4_000);
+  });
+
+  it("records nothing for a retag that replaces a set with itself", async () => {
+    const { engine, advance } = harness([counter]);
+    await engine.start(counter, null, { id: "r1", tags: ["order:1"] });
+    advance(1_000);
+
+    await engine.retag("r1", [" order:1 "]);
+
+    // That retag wrote nothing at all, so there is no rename to account for.
+    const run = await engine.get("r1");
+    expect(run?.formerTags).toBeUndefined();
+    expect(tagsSince(run!)).toBe(T0);
+  });
+
+  it("drops the oldest names past the cap, still dating the current ones", async () => {
+    const { engine, advance } = harness([counter]);
+    await engine.start(counter, null, { id: "r1", tags: ["tenant:0"] });
+    for (let i = 1; i <= MAX_FORMER_TAGS + 3; i++) {
+      advance(1_000);
+      await engine.retag("r1", [`tenant:${i}`]);
+    }
+
+    // A caller reconciling tags in a loop must not be able to grow the record
+    // without bound, and what it pushes out is the oldest window.
+    const run = await engine.get("r1");
+    expect(run?.formerTags).toHaveLength(MAX_FORMER_TAGS);
+    expect(run?.formerTags?.[0]?.tags).toEqual([`tenant:${MAX_FORMER_TAGS + 2}`]);
+    expect(run?.formerTags?.at(-1)?.tags).toEqual(["tenant:3"]);
+    // Each kept window still carries its own start, so the cap cannot stretch
+    // the oldest one back over the renames it dropped.
+    expect(run?.formerTags?.at(-1)?.from).toBe(T0 + 3_000);
+    expect(tagsSince(run!)).toBe(T0 + (MAX_FORMER_TAGS + 3) * 1_000);
+  });
+
+  it("leaves each generation of a chain its own account of its names", async () => {
+    const batches = defineWorkflow<number, number>("batches", async (ctx, left) => {
+      await ctx.waitFor("go");
+      return left > 1 ? ctx.continueAsNew(left - 1) : left;
+    });
+    const { engine, advance } = harness([batches]);
+    await engine.start(batches, 2, { id: "r1", tags: ["order:4182"] });
+    await engine.settle("r1");
+    advance(1_000);
+    await engine.retag("r1", ["order:4182", "tenant:acme"]);
+    await engine.signal("r1", "go");
+    expect((await engine.settle("r1")).id).toBe("r1~2");
+
+    // The rename happened to the generation that was doing the work then, and
+    // stays on it: the successor inherits the names, not the account of them,
+    // which it has no window of its own for.
+    expect((await engine.get("r1"))?.formerTags).toEqual([
+      { tags: ["order:4182"], from: T0, until: T0 + 1_000 },
+    ]);
+    expect((await engine.get("r1~2"))?.formerTags).toBeUndefined();
+    expect(tagsSince((await engine.get("r1~2"))!)).toBe(T0 + 1_000);
   });
 
   it("shows a found run's tags on its view", async () => {
