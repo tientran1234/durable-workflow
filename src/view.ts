@@ -1,7 +1,8 @@
 import { historyEvents } from "./compaction.js";
 import { chainRoot, runGeneration } from "./continuation.js";
 import { TERMINAL } from "./due.js";
-import type { HistoryEvent, RejectedSignal, RunRecord, RunStatus } from "./types.js";
+import { tagsSince } from "./tags.js";
+import type { FormerTags, HistoryEvent, RejectedSignal, RunRecord, RunStatus } from "./types.js";
 import { runVersion } from "./versions.js";
 
 /** One history event as a line on a timeline. */
@@ -52,6 +53,16 @@ export interface RunView {
   blockedOn: RunBlockedOn | null;
   /** The application's names for this run, as `list({ tag })` matches them. */
   tags: string[];
+  /** When the run started carrying those names: its last retag, or its start. */
+  tagsSince: number;
+  /**
+   * The names it carried before, newest first, each with the window it was
+   * reached by. An operator holding a name nothing answers for any more lands
+   * here: the tags above say what the run is called, and these say that it is
+   * nonetheless the run they meant. Capped, so a run renamed often enough has
+   * only its recent names here.
+   */
+  formerTags: FormerTags[];
   /** Signals buffered ahead of their waitFor, by name, with how many payloads each. */
   pendingSignals: Record<string, number>;
   /**
@@ -109,6 +120,13 @@ export interface ChainView {
   blockedOn: RunBlockedOn | null;
   /** The chain's names, as `list({ tag })` matches them. Tags follow a handover. */
   tags: string[];
+  /**
+   * When the chain started carrying them. A handover copies the names forward
+   * and nothing else, so this is the live generation's own answer: what the
+   * chain was called before a rename is on the generation it was renamed on,
+   * under that run's `formerTags`.
+   */
+  tagsSince: number;
   /** The root's start, so an offset on the timeline below is an age of the work. */
   createdAt: number;
   updatedAt: number;
@@ -139,6 +157,8 @@ export function renderRun(run: RunRecord): RunView {
     error: run.error,
     blockedOn: blockedOn(run),
     tags: run.tags ?? [],
+    tagsSince: tagsSince(run),
+    formerTags: run.formerTags ?? [],
     pendingSignals: Object.fromEntries(
       Object.entries(run.pendingSignals).map(([name, payloads]) => [name, payloads.length]),
     ),
@@ -185,6 +205,7 @@ export function renderChain(generations: RunRecord[]): ChainView {
     error: live.error,
     blockedOn: live.blockedOn,
     tags: live.tags,
+    tagsSince: live.tagsSince,
     createdAt: root.createdAt,
     updatedAt: live.updatedAt,
     durationMs: live.updatedAt - root.createdAt,

@@ -1056,6 +1056,50 @@ describe("tags", () => {
     expect((await engine.view("r1"))?.tags).toEqual(["order:1"]);
     expect((await engine.view("r2"))?.tags).toEqual([]);
   });
+
+  it("shows the names a run has stopped answering to on its view", async () => {
+    const { engine, advance } = harness([counter]);
+    await engine.start(counter, null, { id: "r1", tags: ["order:1"] });
+    advance(2_000);
+    await engine.retag("r1", ["order:4182"]);
+    await engine.start(counter, null, { id: "r2", tags: ["order:7"] });
+
+    const renamed = await engine.view("r1");
+    expect(renamed?.tags).toEqual(["order:4182"]);
+    expect(renamed?.tagsSince).toBe(T0 + 2_000);
+    expect(renamed?.formerTags).toEqual([{ tags: ["order:1"], from: T0, until: T0 + 2_000 }]);
+
+    // A run nobody has renamed has carried its names since it started, and an
+    // empty list rather than a missing one: a screen reads both the same way.
+    const untouched = await engine.view("r2");
+    expect(untouched?.formerTags).toEqual([]);
+    expect(untouched?.tagsSince).toBe(untouched?.createdAt);
+  });
+
+  it("dates a chain's names from the generation carrying them", async () => {
+    const batches = defineWorkflow<number, number>("batches", async (ctx, left) => {
+      await ctx.waitFor("go");
+      return left > 1 ? ctx.continueAsNew(left - 1) : left;
+    });
+    const { engine, advance } = harness([batches]);
+    await engine.start(batches, 2, { id: "r1", tags: ["order:4182"] });
+    await engine.settle("r1");
+    advance(1_000);
+    await engine.retag("r1", ["order:4182", "tenant:acme"]);
+    await engine.signal("r1", "go");
+    expect((await engine.settle("r1")).id).toBe("r1~2");
+
+    const chain = await engine.viewChain("r1");
+    expect(chain?.tags).toEqual(["order:4182", "tenant:acme"]);
+    // A handover copies the names forward and nothing else, so the chain dates
+    // them from the generation now carrying them, and the rename itself stays
+    // on the generation it happened to.
+    expect(chain?.tagsSince).toBe(T0 + 1_000);
+    expect(chain?.runs.map((r) => r.formerTags)).toEqual([
+      [{ tags: ["order:4182"], from: T0, until: T0 + 1_000 }],
+      [],
+    ]);
+  });
 });
 
 describe("run view", () => {

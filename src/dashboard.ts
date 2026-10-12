@@ -271,7 +271,7 @@ function runPage(view: RunView, url: URL, title: string, csrfToken: string | nul
     ["started", text(stamp(view.createdAt))],
     ["duration", text(elapsed(view.durationMs))],
     ["blocked on", blocked(view.blockedOn)],
-    ["tags", view.tags.length ? view.tags.map((t) => `<span class="tag">${text(t)}</span>`).join(" ") : dim("—")],
+    ["tags", tags(view)],
   ];
   // Generations count from 1, so a chain is only worth a row once the work has
   // been handed on at least once — and then the root is the id an operator
@@ -306,6 +306,7 @@ function runPage(view: RunView, url: URL, title: string, csrfToken: string | nul
     section("Input", json(view.input)),
     view.status === "completed" ? section("Output", json(view.output)) : "",
     rejected(view.rejectedSignals),
+    formerTags(view.formerTags),
     timeline(view, rows),
     signalForm(view, url, csrfToken),
     `<footer class="dim">${text(title)}</footer>`,
@@ -328,6 +329,30 @@ function timeline(view: RunView, rows: string[]): string {
           <tbody>${rows.join("")}</tbody>
         </table>`;
   return `<h2>Timeline</h2>${caveat}${body}`;
+}
+
+function tags(view: RunView): string {
+  const names = view.tags.length ? view.tags.map((t) => `<span class="tag">${text(t)}</span>`).join(" ") : dim("—");
+  // Only once the run has been renamed: on every other run "since" would date
+  // the tags to the run's own start, which the row above it already says.
+  if (view.formerTags.length === 0) return names;
+  return `${names} <span class="dim">since ${text(stamp(view.tagsSince))}</span>`;
+}
+
+function formerTags(former: RunView["formerTags"]): string {
+  if (former.length === 0) return "";
+  // The operator who needs this arrived by a name the filter above no longer
+  // finds, so the point of each line is the window: the run is theirs, and
+  // this is when it stopped being the one they are describing.
+  const items = former
+    .map((entry) => {
+      const names = entry.tags.length
+        ? entry.tags.map((t) => `<span class="tag">${text(t)}</span>`).join(" ")
+        : dim("untagged");
+      return `<li>${names} <span class="dim">${text(`${stamp(entry.from)} → ${stamp(entry.until)}`)}</span></li>`;
+    })
+    .join("");
+  return `<h2>Former tags</h2><ul class="names">${items}</ul>`;
 }
 
 function rejected(signals: RunView["rejectedSignals"]): string {
@@ -536,7 +561,7 @@ button { cursor: pointer; background: var(--accent); border-color: var(--accent)
 .banner { padding: .5rem .75rem; border-radius: 6px; border: 1px solid var(--line); }
 .banner.ok { border-color: #15803d55; color: #15803d; }
 .banner.error { border-color: #dc262655; color: #dc2626; }
-.rejected { padding-left: 1.2rem; }
+.rejected, .names { padding-left: 1.2rem; }
 .pager { margin: 1rem 0 0; }
 footer { margin-top: 3rem; font-size: .8rem; }
 `;

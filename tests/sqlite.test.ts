@@ -273,6 +273,25 @@ describe("SqliteStore", () => {
     }
   });
 
+  it("keeps the name a retag replaced on the record another process reads", async () => {
+    let now = T0;
+    const engine = new Engine({ store, workflows: [wf], now: () => now });
+    await engine.start(wf, { n: 1 }, { id: "r1", tags: ["order:1"] });
+    now += 3_000;
+    await engine.retag("r1", ["order:4182"]);
+
+    // The account is only worth keeping if it outlives the process that wrote
+    // it: an operator holding order:1 arrives long after the rename.
+    const other = connect();
+    try {
+      expect((await other.store.get("r1"))?.formerTags).toEqual([
+        { tags: ["order:1"], from: T0, until: T0 + 3_000 },
+      ]);
+    } finally {
+      other.db.close();
+    }
+  });
+
   it("rejects a stale retag, leaving the record and the index as they were", async () => {
     const engine = new Engine({ store, workflows: [wf], now: () => T0 });
     await engine.start(wf, { n: 1 }, { id: "r1", tags: ["order:1"] });

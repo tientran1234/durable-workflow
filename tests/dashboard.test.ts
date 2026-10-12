@@ -206,6 +206,39 @@ describe("dashboard", () => {
     expect(body).toContain("approved: expected boolean");
   });
 
+  it("shows the names a run has stopped answering to, and since when", async () => {
+    const { engine, advance } = harness([fulfilment]);
+    await engine.start(fulfilment, { order: "ord_1" }, { id: "run-1", tags: ["order:ord_1"] });
+    advance(2_000);
+    await engine.retag("run-1", ["order:ord_4182"]);
+    const handler = engine.dashboard();
+
+    const body = await (await handler(get("?run=run-1"))).text();
+
+    // The operator got here by a name the filter above no longer finds, so the
+    // page has to say both that this is the run and when it stopped being the
+    // one they are describing.
+    expect(body).toContain("Former tags");
+    expect(body).toContain("order:ord_1");
+    expect(body).toContain("order:ord_4182");
+    expect(body).toContain("since 2027-01-15 08:00:02Z");
+    expect(body).toContain("2027-01-15 08:00:00Z → 2027-01-15 08:00:02Z");
+  });
+
+  it("leaves the former tags off a run nobody has renamed", async () => {
+    const { engine } = harness([fulfilment]);
+    await engine.start(fulfilment, { order: "ord_1" }, { id: "run-1", tags: ["order:ord_1"] });
+    const handler = engine.dashboard();
+
+    const body = await (await handler(get("?run=run-1"))).text();
+
+    // Nothing to account for, so no section and no "since": the started row
+    // already dates the names a run has carried all along.
+    expect(body).toContain("order:ord_1");
+    expect(body).not.toContain("Former tags");
+    expect(body).not.toContain("since 2027-01-15");
+  });
+
   it("will not offer to signal a run that has ended", async () => {
     const { engine, advance } = harness([fulfilment]);
     const id = await engine.start(fulfilment, { order: "ord_1" }, { id: "run-1" });

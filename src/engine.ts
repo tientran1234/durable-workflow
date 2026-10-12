@@ -18,7 +18,7 @@ import { DEFAULT_RETRY } from "./retry.js";
 import { compensatedError, runCompensations } from "./saga.js";
 import { type ScheduleOptions, type ScheduledRun, schedulePeriod, scheduleRunId } from "./schedule.js";
 import { type SignalDefinition, SignalRegistry, recordRejection, signalName } from "./signals.js";
-import { normalizeTags, sameTags } from "./tags.js";
+import { normalizeTags, recordFormerTags, sameTags } from "./tags.js";
 import type { ChildHandle, RetryPolicy, RunPage, RunQuery, RunRecord, RunStore, WorkflowDefinition } from "./types.js";
 import { type ChainView, type RunView, renderChain, renderRun } from "./view.js";
 import { WorkflowRegistry, runVersion } from "./versions.js";
@@ -336,6 +336,11 @@ export class Engine {
    * account of what the run was called at the time, and `viewChain` still
    * reads the chain as one piece of work from any of them.
    *
+   * The set replaced goes onto the run, with the window it was carried in, so
+   * the name an operator arrived holding still leads to the run that answered
+   * to it and says when it stopped. Only the most recent renames are kept —
+   * see MAX_FORMER_TAGS.
+   *
    * Throws ConflictError if another writer moved the run in between, as the
    * writes above it do. Nothing was written, so the call can be made again
    * against the run as it then stands.
@@ -348,11 +353,16 @@ export class Engine {
     // costs whatever worker is holding the run its pass.
     if (sameTags(run.tags ?? [], next)) return run;
 
+    const now = this.now();
+    // Before the new tags go on: the set this is replacing and the window it
+    // was carried in are both read off the run as it still stands.
+    recordFormerTags(run, now);
+
     // Absent rather than empty, which is the shape an untagged run has always
     // had, so nothing downstream gets a second way to read "no tags".
     if (next.length === 0) delete run.tags;
     else run.tags = next;
-    run.updatedAt = this.now();
+    run.updatedAt = now;
     if (!(await this.store.retag(run, run.version))) throw new ConflictError(run.id);
     return run;
   }
