@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-12
+
+- A CSRF token on the dashboard: `dashboard(engine, { csrf })` writes the mounting layer's token into the signal form and refuses a post that does not come back with one it verifies, so resuming a run through this screen takes a form it rendered for the session making the request — the token is asked for per request and only while rendering a run, since the filters are a GET, and the check fails closed on a missing field or a `verify` that throws; mounted without the option the screen takes a cross-site post exactly as it did before.
+
 ## 2026-10-10
 
 - Retagging a run: `engine.retag(id, tags)` replaces a run's tags and the index rows behind them in one transaction, so a run raised against the wrong tenant stops answering for the name it no longer carries and starts answering for the one it does — addressed at the generation doing the work the way `signal` and `cancel` are, with the index rows keeping the run's `created_at` so a rename does not move it to the top of its new tag's page, and the generations a chain has handed off keeping the names they ran under.

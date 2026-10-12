@@ -25,3 +25,4 @@ Same rule: one item per change, in order.
 - [x] Matching several tags at once: `engine.list({ tag: [...] })` returns the runs carrying every tag in the set, answered from the same index both durable stores already keep.
 - [x] Cancelling the work a step timeout abandoned: the step's `fn` is handed an `AbortSignal` that is aborted when `timeoutMs` elapses, so a cooperating client stops with the attempt.
 - [x] Retagging a run: `engine.retag(id, tags)` replaces a run's tags and the index rows behind them in one transaction, addressed at the generation doing the work the way `signal` and `cancel` are.
+- [x] A CSRF token on the dashboard: `dashboard(engine, { csrf })` writes the mounting layer's token into the signal form and refuses a post it does not verify, so the session the token is bound to stays that layer's.

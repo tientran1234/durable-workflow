@@ -566,8 +566,29 @@ export interface DashboardEngine {
 It takes that interface rather than an `Engine`, so the screen can only do what
 an operator should: there is no `cancel` on it and no store behind it. Mount it
 on a path your admin surface already authenticates — **it authenticates nobody
-itself**, it reads every run's input and output, and it can resume a run. See
-below for why the CSRF token is that layer's too.
+itself**, it reads every run's input and output, and it can resume a run.
+
+That layer owns the session, so it owns the CSRF token too: `csrf` asks it for
+one rather than minting one here, and the dashboard refuses a post that does
+not come back with a token it verifies.
+
+```ts
+const admin = engine.dashboard({
+  csrf: {
+    token: (request) => tokenFor(session(request)),            // written into the signal form
+    verify: (request, token) => token === tokenFor(session(request)),
+  },
+});
+```
+
+`token` is called while rendering a run — the one page with a form that
+changes anything — and the value goes into a hidden `_csrf` field. `verify`
+decides a post before the form is read, and a post it does not accept is a
+403 page rather than the redirect a bad payload gets: those are an operator's
+mistakes, to be read on the run page they came from, and this is a request
+whose browser is not looking at this screen. It fails closed — a missing
+field is no token, and a `verify` that throws has not said yes. Without the
+option nothing is checked, which is where this screen started.
 
 ## Hooks
 
@@ -1011,12 +1032,14 @@ CI runs the full suite, Postgres included, on every push.
   that does not watch the signal, or a client that takes none, runs on exactly
   as before, and the retry may do the same thing a second time. Nothing here
   can close that: the step's own idempotency key is what covers it.
-- **Authentication, and the CSRF token that goes with it.** `engine.dashboard()`
-  serves whoever reaches it, and a cross-site form can post to it. Both belong
-  to the layer you mount it behind: a token has to be bound to a session, and
-  the session is the one thing a handler with no user model cannot have. The
-  consequence is a rule rather than a setting — do not route to it from the
-  public internet.
+- **Authentication, and a CSRF token of our own.** `engine.dashboard()` serves
+  whoever reaches it. Authentication belongs to the layer you mount it behind,
+  and so does the session a token is bound to — the one thing a handler with no
+  user model cannot have — so `csrf` asks that layer for the token and for the
+  verdict on the one that comes back, and owns nothing but the field and the
+  refusal. A dashboard mounted without it takes a cross-site post as it always
+  did, which makes the rule the same rule: do not route to it from the public
+  internet.
 - **Cancelling, retrying or editing a run from the dashboard.** The screen can
   send a signal and nothing else. A signal is a message the workflow already
   asked for and handles on a path it defines; a cancel button is an operator
