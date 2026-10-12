@@ -2,6 +2,8 @@
 
 ## 2026-10-12
 
+- The history of what a run was called: `engine.retag` keeps the set it replaced and the window the run carried it in, newest first and capped at `MAX_FORMER_TAGS`, so an operator reaching a run by a name the tag index has stopped answering for can tell it is the run they meant and see when it stopped being the one they are describing — surfaced as `view.formerTags` and `view.tagsSince`, and on the dashboard as a since on the tags row and a Former tags section; each entry carries its own start rather than deriving it from the next, so the cap cannot stretch the oldest window back over the renames it dropped, a run given its first name records the empty set it had until then, and a handover copies the names forward without the account of them, which stays on the generation that was renamed.
+
 - A CSRF token on the dashboard: `dashboard(engine, { csrf })` writes the mounting layer's token into the signal form and refuses a post that does not come back with one it verifies, so resuming a run through this screen takes a form it rendered for the session making the request — the token is asked for per request and only while rendering a run, since the filters are a GET, and the check fails closed on a missing field or a `verify` that throws; mounted without the option the screen takes a cross-site post exactly as it did before.
 
 ## 2026-10-10

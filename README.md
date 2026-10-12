@@ -465,6 +465,10 @@ await engine.list({ tag: "tenant:acme", status: "waiting", limit: 20 });   // an
 await engine.list({ tag: ["tenant:acme", "order:ord_4182"] });     // the run that is both
 
 await engine.retag(runId, ["order:ord_4182", "tenant:other"]);   // raised against the wrong account
+
+const view = await engine.view(runId);
+view.tagsSince;    // when it started carrying the names it has now
+view.formerTags;   // [{ tags: ["order:ord_4182", "tenant:acme"], from, until }]
 ```
 
 A tag query narrows alongside `workflow` and `status` and pages by the same
@@ -509,6 +513,22 @@ writer throws `ConflictError` having written nothing, like every other write
 here. A run that has finished can be renamed too, since the names index the
 record, which outlives the run.
 
+A rename leaves the set it replaced on the run, with the window the run carried
+it in, because the operator who most needs the record is the one holding a name
+the index has stopped answering for: `view.formerTags` is those sets newest
+first, and `view.tagsSince` is when the current ones took effect. The window is
+stored on each entry rather than derived from the next, since a run keeps only
+its most recent renames — `MAX_FORMER_TAGS` of them, so a caller reconciling
+tags on a schedule cannot grow the record without bound — and a reader walking
+back from the oldest kept entry would otherwise read the renames the cap
+dropped as part of a window the run never carried. A run given its first name
+records the empty set it had until then, which is what stops the name it now
+carries reading as one it has had since it started, and a retag that changes
+nothing records nothing because it writes nothing. The names follow
+`ctx.continueAsNew` but the account of them does not: each generation holds the
+renames that happened while it was the one doing the work, which is where
+`viewChain` shows them.
+
 A tag that could not be indexed is refused at `engine.start` and at
 `engine.retag` rather than dropped: empty, longer than 128 characters, or more
 than 16 on one run. The failure mode worth avoiding is an operator searching
@@ -530,9 +550,10 @@ app.all("/ops/workflows/*", (c) => admin(c.req.raw));         // or a route in w
 
 What it serves is three screens and one action: the run list, filtered by
 workflow, status and tag and paged by the same cursor `engine.list` returns;
-one run, with its facts, its input and output, and its history as the timeline
-`engine.view` renders; and a form that sends a signal to the run you are
-looking at, pre-filled with the name it is waiting for.
+one run, with its facts, its input and output, the names it has been renamed
+out of, and its history as the timeline `engine.view` renders; and a form that
+sends a signal to the run you are looking at, pre-filled with the name it is
+waiting for.
 
 Each response is one self-contained HTML document — styles inline, no scripts,
 no assets to host, every action a link or a form. There is nothing to build and
@@ -1001,14 +1022,12 @@ CI runs the full suite, Postgres included, on every push.
   every row's chain to decide whether to show it, against an index that orders
   runs and knows nothing about generations. A tag names every generation at
   once, which is how to get a chain's runs back in one query.
-- **The history of what a run was called.** `engine.retag` replaces a run's
-  tags; it does not keep the set it replaced, so a run found under
-  `order:4182` cannot say when it started carrying that name. Tags are an
-  index into the record, and keeping every set a run has ever had would be a
-  labelling system with an audit log attached — paid for on a write path that
-  exists to correct a mistake. The generations a continuation chain has handed
-  off do keep the names they ran under, which is the one part of this the
-  chain answers for nothing.
+- **Every name a run has ever had.** `engine.retag` keeps the set it replaced
+  — see Tags — but only `MAX_FORMER_TAGS` of them, so a run renamed more often
+  than that has lost its earliest windows and says so by not covering them.
+  Keeping all of them would be a labelling system with an audit log attached,
+  on a write path that exists to correct a mistake, and the rename an operator
+  is holding the old name from is the recent one.
 - **Continuing a run from outside it.** `ctx.continueAsNew` is a decision the
   workflow makes about its own state, and only the workflow knows what the next
   generation needs to be handed. There is no `engine.continueAsNew`; cancelling
