@@ -77,19 +77,22 @@ const STATUSES: RunStatus[] = ["running", "sleeping", "waiting", "completed", "f
  * it was mounted, and the links it writes are relative to whatever path the
  * request came in on — `/admin`, `/_internal/workflows`, the root.
  *
- * It is unauthenticated and unprotected against cross-site posts by design:
- * it reads every run's input and output and can resume a run, so it belongs
- * behind whatever already guards the rest of your admin surface, and that is
- * the layer that owns the session a CSRF token would be bound to.
+ * It authenticates nobody: it reads every run's input and output and can
+ * resume a run, so it belongs behind whatever already guards the rest of your
+ * admin surface. That layer owns the session a CSRF token is bound to, which
+ * is why `csrf` takes the token from it rather than minting one here — and
+ * without `csrf` the screen is as open to a cross-site post as it has always
+ * been.
  */
 export function dashboard(engine: DashboardEngine, options: DashboardOptions = {}): DashboardHandler {
   const limit = pageLimit(options.limit ?? DASHBOARD_LIMIT);
   const title = options.title ?? "durable-workflow";
+  const csrf = options.csrf;
 
   return async (request: Request): Promise<Response> => {
     const url = new URL(request.url);
 
-    if (request.method === "POST") return send(engine, request, url);
+    if (request.method === "POST") return send(engine, request, url, csrf, title);
     if (request.method !== "GET" && request.method !== "HEAD") {
       return new Response("method not allowed", { status: 405, headers: { allow: "GET, HEAD, POST" } });
     }
@@ -99,7 +102,9 @@ export function dashboard(engine: DashboardEngine, options: DashboardOptions = {
 
     const view = await engine.view(runId);
     if (!view) return html(notFound(runId, url, title), 404);
-    return html(runPage(view, url, title));
+    // Only the run page carries a form that changes anything, so it is the
+    // only request a token is asked for: the filters are a GET.
+    return html(runPage(view, url, title, csrf ? await csrf.token(request) : null));
   };
 }
 
@@ -113,8 +118,23 @@ export function dashboard(engine: DashboardEngine, options: DashboardOptions = {
  * is exactly what somebody watching a run they just resumed does — re-reads
  * the run instead of sending the signal a second time.
  */
-async function send(engine: DashboardEngine, request: Request, url: URL): Promise<Response> {
+async function send(
+  engine: DashboardEngine,
+  request: Request,
+  url: URL,
+  csrf: DashboardCsrf | undefined,
+  title: string,
+): Promise<Response> {
   const form = await request.formData();
+
+  // Before anything is read out of the form, and answered as a page rather
+  // than the redirect an operator's own mistakes get: a post this session did
+  // not make has no run page to be sent back to, and the browser that made it
+  // is not the one looking.
+  if (csrf && !(await accepted(csrf, request, String(form.get(CSRF_FIELD) ?? "")))) {
+    return html(refused(url, title), 403);
+  }
+
   const runId = String(form.get("run") ?? "");
   const name = String(form.get("signal") ?? "").trim();
   const body = String(form.get("payload") ?? "").trim();
@@ -147,6 +167,20 @@ async function send(engine: DashboardEngine, request: Request, url: URL): Promis
     back.searchParams.set("error", err instanceof Error ? err.message : String(err));
   }
   return seeOther(back);
+}
+
+/**
+ * Whether the post may go on to the engine. Fails closed: an empty field is
+ * no token at all, and a check that throws has not said yes — a session store
+ * that is down must not be the thing that lets a cross-site post through.
+ */
+async function accepted(csrf: DashboardCsrf, request: Request, token: string): Promise<boolean> {
+  if (token === "") return false;
+  try {
+    return await csrf.verify(request, token);
+  } catch {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +261,7 @@ function nextPageLink(url: URL, cursor: string): string {
 // ---------------------------------------------------------------------------
 // One run
 
-function runPage(view: RunView, url: URL, title: string): string {
+function runPage(view: RunView, url: URL, title: string, csrfToken: string | null): string {
   const sent = url.searchParams.get("sent");
   const error = url.searchParams.get("error");
 
@@ -273,7 +307,7 @@ function runPage(view: RunView, url: URL, title: string): string {
     view.status === "completed" ? section("Output", json(view.output)) : "",
     rejected(view.rejectedSignals),
     timeline(view, rows),
-    signalForm(view, url),
+    signalForm(view, url, csrfToken),
     `<footer class="dim">${text(title)}</footer>`,
   ]);
 }
@@ -307,13 +341,15 @@ function rejected(signals: RunView["rejectedSignals"]): string {
   return `<h2>Rejected signals</h2><ul class="rejected">${items}</ul>`;
 }
 
-function signalForm(view: RunView, url: URL): string {
+function signalForm(view: RunView, url: URL, csrfToken: string | null): string {
   if (["completed", "failed", "canceled", "continued"].includes(view.status)) {
     return `<h2>Send a signal</h2><p class="dim">This run is ${text(view.status)}; it cannot be signalled.</p>`;
   }
   const waiting = view.blockedOn?.kind === "signal" ? view.blockedOn.name : "";
+  const token = csrfToken === null ? "" : `<input type="hidden" name="${CSRF_FIELD}" value="${text(csrfToken)}" />`;
   return `<h2>Send a signal</h2>
     <form class="signal" method="post" action="${text(link(url))}">
+      ${token}
       <input type="hidden" name="run" value="${text(view.id)}" />
       <label>name <input type="text" name="signal" value="${text(waiting)}" placeholder="manual-review" required /></label>
       <label>payload <textarea name="payload" rows="4" placeholder="JSON, or leave empty for null"></textarea></label>
@@ -323,6 +359,19 @@ function signalForm(view: RunView, url: URL): string {
 
 // ---------------------------------------------------------------------------
 // HTML
+
+/**
+ * A post the mounting layer did not vouch for. It names no run and offers no
+ * form: whatever made this request, the page it should be reading is the one
+ * it reached this screen through.
+ */
+function refused(url: URL, title: string): string {
+  return document(title, [
+    `<h1>Refused</h1>`,
+    `<p>That form did not come from this session, or it has been open long enough to expire.</p>`,
+    `<p class="pager"><a href="${text(link(url))}">← all runs</a></p>`,
+  ]);
+}
 
 function notFound(runId: string, url: URL, title: string): string {
   return document(title, [
