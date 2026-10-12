@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { type DashboardEngine, type RunQuery, dashboard, defineSignal, defineWorkflow } from "../src/index.js";
+import { type DashboardCsrf, type DashboardEngine, type RunQuery, dashboard, defineSignal, defineWorkflow } from "../src/index.js";
 import { harness } from "./helpers.js";
 
 const fulfilment = defineWorkflow<{ order: string }, string>("fulfilment", async (ctx) => {
@@ -279,5 +279,137 @@ describe("dashboard", () => {
     expect(body).toContain("<title>Acme ops</title>");
     expect(body).toContain("?run=run-2");
     expect(body).not.toContain("?run=run-1");
+  });
+});
+
+/**
+ * The token the signal form carries, and the post refused without it. The
+ * session it is bound to is the mounting layer's, so every test here plays
+ * that layer: a cookie it reads, a token it mints from it.
+ */
+describe("dashboard CSRF", () => {
+  const sid = (request: Request) => /sid=(\w+)/.exec(request.headers.get("cookie") ?? "")?.[1] ?? "";
+  /** A layer that binds its token to the session its cookie names. */
+  const bound: DashboardCsrf = {
+    token: (request) => `tok-${sid(request)}`,
+    verify: (request, token) => token === `tok-${sid(request)}`,
+  };
+
+  /** The same request, arriving with the cookie the layer in front reads. */
+  function as(session: string, request: Request): Request {
+    const headers = new Headers(request.headers);
+    headers.set("cookie", `sid=${session}`);
+    return new Request(request, { headers });
+  }
+
+  /** A waiting run, which is the only state the form is offered for. */
+  async function waiting() {
+    const { engine, advance } = harness([fulfilment]);
+    const id = await engine.start(fulfilment, { order: "ord_1" }, { id: "run-1" });
+    await engine.settle(id);
+    advance(1_000);
+    await engine.settle(id);
+    return { engine, id };
+  }
+
+  function tokenIn(body: string): string {
+    const token = /name="_csrf" value="([^"]*)"/.exec(body)?.[1];
+    expect(token).toBeDefined();
+    return token!.replaceAll("&quot;", '"').replaceAll("&amp;", "&");
+  }
+
+  it("writes the layer's token into the signal form, asked for per request", async () => {
+    const { engine } = await waiting();
+    const asked: string[] = [];
+    const handler = engine.dashboard({
+      csrf: { token: (request) => (asked.push(sid(request)), `tok"${sid(request)}`), verify: () => true },
+    });
+
+    const body = await (await handler(as("alice", get("?run=run-1")))).text();
+
+    // Escaped like every other value this page writes into an attribute.
+    expect(body).toContain('name="_csrf" value="tok&quot;alice"');
+    expect(tokenIn(body)).toBe('tok"alice');
+    expect(asked).toEqual(["alice"]);
+  });
+
+  it("refuses a post with no token, and one the layer does not recognise", async () => {
+    const { engine, id } = await waiting();
+    const checked: string[] = [];
+    const handler = engine.dashboard({
+      csrf: { token: bound.token, verify: (request, token) => (checked.push(token), bound.verify(request, token)) },
+    });
+
+    for (const fields of [
+      { run: "run-1", signal: "review", payload: '{"approved":true}' },
+      { run: "run-1", signal: "review", payload: '{"approved":true}', _csrf: "tok-mallory" },
+    ]) {
+      const response = await handler(as("alice", post(fields)));
+      expect(response.status).toBe(403);
+      expect(await response.text()).toContain("did not come from this session");
+    }
+
+    // A refused post is not an operator's mistake to narrate on the run page:
+    // the engine was never asked, so the run is where it was.
+    expect((await engine.view(id))?.status).toBe("waiting");
+    expect(checked).toEqual(["tok-mallory"]); // nothing to verify when the field is absent
+  });
+
+  it("accepts the token out of the form it rendered", async () => {
+    const { engine, id } = await waiting();
+    const handler = engine.dashboard({ csrf: bound });
+
+    const page = await (await handler(as("alice", get("?run=run-1")))).text();
+    const response = await handler(
+      as("alice", post({ run: "run-1", signal: "review", payload: '{"approved":true}', _csrf: tokenIn(page) })),
+    );
+
+    expect(response.status).toBe(303);
+    expect(response.headers.get("location")).toBe("/ops/workflows?run=run-1&sent=review");
+    expect((await engine.view(id))?.status).toBe("completed");
+  });
+
+  it("will not take one session's token from another, which is the point of binding it", async () => {
+    const { engine, id } = await waiting();
+    const handler = engine.dashboard({ csrf: bound });
+
+    const alices = tokenIn(await (await handler(as("alice", get("?run=run-1")))).text());
+    const fields = { run: "run-1", signal: "review", payload: '{"approved":true}', _csrf: alices };
+
+    const stolen = await handler(as("mallory", post(fields)));
+    expect(stolen.status).toBe(403);
+    expect((await engine.view(id))?.status).toBe("waiting");
+
+    const owner = await handler(as("alice", post(fields)));
+    expect(owner.status).toBe(303);
+    expect((await engine.view(id))?.status).toBe("completed");
+  });
+
+  it("fails closed when the check itself cannot answer", async () => {
+    const { engine, id } = await waiting();
+    const handler = engine.dashboard({
+      csrf: {
+        token: bound.token,
+        verify: () => {
+          throw new Error("session store is down");
+        },
+      },
+    });
+
+    const response = await handler(as("alice", post({ run: "run-1", signal: "review", payload: "null", _csrf: "tok-alice" })));
+
+    expect(response.status).toBe(403);
+    expect((await engine.view(id))?.status).toBe("waiting");
+  });
+
+  it("leaves a dashboard mounted without it exactly where it was", async () => {
+    const { engine, id } = await waiting();
+
+    const body = await (await engine.dashboard()(get("?run=run-1"))).text();
+    expect(body).not.toContain("_csrf");
+
+    const response = await engine.dashboard()(post({ run: "run-1", signal: "review", payload: '{"approved":true}' }));
+    expect(response.status).toBe(303);
+    expect((await engine.view(id))?.status).toBe("completed");
   });
 });

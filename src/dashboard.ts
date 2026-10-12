@@ -27,7 +27,38 @@ export interface DashboardOptions {
   limit?: number;
   /** Heading, and the document title. Defaults to "durable-workflow". */
   title?: string;
+  /**
+   * Bind the signal form to the session the layer in front of this one holds.
+   * Absent, a post is taken from wherever it came from, which is where this
+   * screen started: mounted behind something that already authenticates, with
+   * a rule not to route to it from the public internet.
+   */
+  csrf?: DashboardCsrf;
 }
+
+/**
+ * The two halves of a CSRF check, supplied by whoever mounts the dashboard.
+ *
+ * A token has to be bound to a session, and a handler with no user model has
+ * no session to bind one to — so the token is not minted here, it is asked
+ * for. The layer that authenticated the request hands one over per request
+ * and says, on the way back, whether the token that returned is the one that
+ * session was given. All this screen owns is the plumbing: the field in the
+ * form, and the refusal of a post without it.
+ */
+export interface DashboardCsrf {
+  /**
+   * The token to write into the signal form for the request being rendered.
+   * Per request, because the token is the session's and the session is what
+   * differs between two operators reading the same run.
+   */
+  token(request: Request): string | Promise<string>;
+  /** Whether the token that came back with a post is the one its session was given. */
+  verify(request: Request, token: string): boolean | Promise<boolean>;
+}
+
+/** The form field the token travels in, and the only name a host has to know. */
+const CSRF_FIELD = "_csrf";
 
 /** A page small enough to read on one screen, which is what this is for. */
 export const DASHBOARD_LIMIT = 25;
