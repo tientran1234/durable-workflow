@@ -65,6 +65,7 @@ describe("dashboard", () => {
     const recording: DashboardEngine = {
       list: (query) => (queries.push(query), engine.list(query)),
       view: (id) => engine.view(id),
+      viewChain: (id) => engine.viewChain(id),
       signal: (id, name, payload) => engine.signal(id, name, payload),
     };
     const handler = dashboard(recording);
@@ -268,6 +269,118 @@ describe("dashboard", () => {
     }
   });
 
+  /**
+   * The chain screen: one piece of work, however many runs it has been. Every
+   * test here goes through a chain of three generations, which is the shape
+   * that tells a chain apart from the run an operator happened to open.
+   */
+  describe("a chain", () => {
+    /** Three generations with a leg apiece, ending on a wait. */
+    const relay = defineWorkflow<{ left: number }, string>("relayed", async (ctx, input) => {
+      await ctx.step(`leg-${input.left}`, () => input.left);
+      if (input.left > 1) {
+        await ctx.sleep("breathe", 1_000);
+        return ctx.continueAsNew({ left: input.left - 1 });
+      }
+      return ctx.waitFor<string>("baton");
+    });
+
+    async function chained() {
+      const h = harness([relay]);
+      await h.engine.start(relay, { left: 3 }, { id: "r1", tags: ["order:ord_7"] });
+      for (let i = 0; i < 2; i++) {
+        await h.drain();
+        h.advance(1_000);
+      }
+      await h.drain();
+      return h;
+    }
+
+    it("renders every generation, and all their events on one axis", async () => {
+      const { engine } = await chained();
+
+      const body = await (await engine.dashboard()(get("?chain=r1"))).text();
+
+      expect(body).toContain("Generations");
+      // Each generation is a row of its own, linking to the record whose
+      // history it is: the chain screen is a way into them, not a replacement.
+      expect(body).toContain('href="/ops/workflows?run=r1"');
+      expect(body).toContain('href="/ops/workflows?run=r1~2"');
+      expect(body).toContain('href="/ops/workflows?run=r1~3"');
+      // Every generation's events, which no single run's page can show.
+      for (const leg of ["leg-3", "leg-2", "leg-1"]) {
+        expect(body).toContain(`step &quot;${leg}&quot; completed`);
+      }
+      // Offsets from the root, so the axis reads as the age of the work rather
+      // than restarting at zero on each handover.
+      expect(body).toContain("2.0s");
+    });
+
+    it("answers about the work rather than the generation doing it", async () => {
+      const { engine } = await chained();
+
+      const body = await (await engine.dashboard()(get("?chain=r1"))).text();
+
+      expect(body).toContain("<dt>generations</dt><dd>3</dd>");
+      // The chain was asked to relay three legs; the live generation was asked
+      // for one. The first is the question this page answers.
+      expect(body).toContain("&quot;left&quot;: 3");
+      expect(body).not.toContain("&quot;left&quot;: 1");
+      expect(body).toContain("<code>baton</code>"); // what the work is blocked on
+      expect(body).toContain("order:ord_7");
+      // The generation a signal reaches, named so the one write is a click away.
+      expect(body).toContain('<dt>live</dt><dd><a href="/ops/workflows?run=r1~3"');
+    });
+
+    it("is reached from every generation's own page, the root included", async () => {
+      const { engine } = await chained();
+      const handler = engine.dashboard();
+
+      for (const id of ["r1", "r1~2", "r1~3"]) {
+        const body = await (await handler(get(`?run=${encodeURIComponent(id)}`))).text();
+        // The id is the chain's, not the page's: an operator six generations
+        // back reads the same chain as one holding the live id.
+        expect(body).toContain('href="/ops/workflows?chain=r1"');
+      }
+    });
+
+    it("leaves the chain off a run the work has never been handed on from", async () => {
+      const { engine, drain } = harness([fulfilment]);
+      await engine.start(fulfilment, { order: "ord_1" }, { id: "run-1" });
+      await drain();
+
+      const body = await (await engine.dashboard()(get("?run=run-1"))).text();
+
+      // Nothing has been handed on, so there is no second piece of work to
+      // read as one — the page in front of the operator is the whole of it.
+      expect(body).not.toContain("?chain=");
+      expect(body).not.toContain("<dt>chain</dt>");
+    });
+
+    it("writes nothing: the signal form stays on the run that answers for it", async () => {
+      const { engine } = await chained();
+
+      const body = await (await engine.dashboard({ csrf: { token: () => "tok", verify: () => true } })(
+        get("?chain=r1"),
+      )).text();
+
+      // `signal` walks to the live generation either way, so a form here would
+      // post what that generation's page posts — and the token would be on two
+      // screens instead of one.
+      expect(body).not.toContain("<form");
+      expect(body).not.toContain("_csrf");
+    });
+
+    it("404s a chain that is not there", async () => {
+      const { engine } = harness([relay]);
+
+      const response = await engine.dashboard()(get("?chain=no-such-run"));
+
+      expect(response.status).toBe(404);
+      expect(await response.text()).toContain("No such chain");
+    });
+  });
+
   it("escapes everything it renders, wherever the text came from", async () => {
     const payload = '"><script>alert(1)</script>';
     const wf = defineWorkflow<{ note: string }, unknown>("xss", async (ctx) => ctx.waitFor("mail"));
@@ -285,6 +398,7 @@ describe("dashboard", () => {
       await (await handler(get(`?run=${encodeURIComponent(id)}`))).text(),
       await (await handler(get(`?run=${encodeURIComponent(id)}&error=${encodeURIComponent(payload)}`))).text(),
       await (await handler(get(`?workflow=${encodeURIComponent(payload)}&cursor=${encodeURIComponent(payload)}`))).text(),
+      await (await handler(get(`?chain=${encodeURIComponent(id)}`))).text(),
     ]) {
       expect(body).not.toContain("<script>");
       expect(body).toContain("&lt;script&gt;");

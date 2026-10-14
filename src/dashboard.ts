@@ -1,6 +1,6 @@
 import { pageLimit } from "./list.js";
 import type { RunPage, RunQuery, RunRecord, RunStatus } from "./types.js";
-import type { RunBlockedOn, RunView, TimelineEntry } from "./view.js";
+import type { ChainView, RunBlockedOn, RunView, TimelineEntry } from "./view.js";
 
 /**
  * A handler in the shape every modern server already accepts: Node's
@@ -11,7 +11,7 @@ import type { RunBlockedOn, RunView, TimelineEntry } from "./view.js";
 export type DashboardHandler = (request: Request) => Promise<Response>;
 
 /**
- * What the dashboard asks of an engine: the two reads and the one write. It
+ * What the dashboard asks of an engine: the three reads and the one write. It
  * takes this rather than an `Engine` so the screen stays testable against a
  * stand-in, and so it cannot reach past what an operator is allowed to do —
  * there is no `cancel` here, and no store.
@@ -19,6 +19,12 @@ export type DashboardHandler = (request: Request) => Promise<Response>;
 export interface DashboardEngine {
   list(query: RunQuery): Promise<RunPage>;
   view(id: string): Promise<RunView | null>;
+  /**
+   * The chain a run belongs to, read from any generation's id. A read of the
+   * same class as `view` — it reaches no further than the records that one
+   * already serves, one per generation.
+   */
+  viewChain(id: string): Promise<ChainView | null>;
   signal(id: string, name: string, payload?: unknown): Promise<RunRecord>;
 }
 
