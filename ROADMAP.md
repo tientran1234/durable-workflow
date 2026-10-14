@@ -27,3 +27,4 @@ Same rule: one item per change, in order.
 - [x] Retagging a run: `engine.retag(id, tags)` replaces a run's tags and the index rows behind them in one transaction, addressed at the generation doing the work the way `signal` and `cancel` are.
 - [x] A CSRF token on the dashboard: `dashboard(engine, { csrf })` writes the mounting layer's token into the signal form and refuses a post it does not verify, so the session the token is bound to stays that layer's.
 - [x] The history of what a run was called: `engine.retag` keeps the set it replaced and the window the run carried it in, newest first and capped, so a run reached by a name the index has stopped answering for can say when it stopped carrying it.
+- [x] A chain on the dashboard: `?chain=<id>` renders `engine.viewChain` — every generation as a row into its own history and all their events on one axis — reached from the run page, while the list stays a page of runs.

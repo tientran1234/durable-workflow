@@ -548,10 +548,11 @@ Bun.serve({ fetch: admin });                                  // or Deno.serve, 
 app.all("/ops/workflows/*", (c) => admin(c.req.raw));         // or a route in whatever you have
 ```
 
-What it serves is three screens and one action: the run list, filtered by
+What it serves is four screens and one action: the run list, filtered by
 workflow, status and tag and paged by the same cursor `engine.list` returns;
 one run, with its facts, its input and output, the names it has been renamed
-out of, and its history as the timeline `engine.view` renders; and a form that
+out of, and its history as the timeline `engine.view` renders; the continuation
+chain that run belongs to, as `engine.viewChain` reads it; and a form that
 sends a signal to the run you are looking at, pre-filled with the name it is
 waiting for.
 
@@ -561,10 +562,21 @@ nothing to serve beside it, which is the point: a dashboard you have to deploy
 is a dashboard nobody has during the incident.
 
 It never has to be told where it is mounted. Routing is entirely in the query
-string — `?run=<id>` is one run, no query is the list, a POST sends a signal —
-so the links it writes are relative to the path the request arrived on, and the
-same handler works at `/ops/workflows`, at the root, or behind a proxy that
-rewrites neither.
+string — `?run=<id>` is one run, `?chain=<id>` the chain it belongs to, no
+query is the list, a POST sends a signal — so the links it writes are relative
+to the path the request arrived on, and the same handler works at
+`/ops/workflows`, at the root, or behind a proxy that rewrites neither.
+
+A run's chain row opens that third screen, on the id the chain started under:
+the chain's own input, the outcome the last generation reported and the elapsed
+time across every handover, then each generation as a row into its own history
+and all of their events on one axis. So an operator holding an id from six
+generations ago reads the work rather than the stretch of it that ended before
+the first handover. It is a read and nothing else — `engine.signal` walks to
+the generation doing the work from either screen, so the form stays on the run
+page and the chain names the generation it would reach. The run list is still a
+page of runs: a chain of nine generations is nine rows there, and a tag is what
+names every one of them at once.
 
 The payload box is read as JSON, and an empty one as `null` — the untyped
 signal whose arrival is the whole message. Anything that is not JSON comes back
@@ -580,6 +592,7 @@ itself.
 export interface DashboardEngine {
   list(query: RunQuery): Promise<RunPage>;
   view(id: string): Promise<RunView | null>;
+  viewChain(id: string): Promise<ChainView | null>;
   signal(id: string, name: string, payload?: unknown): Promise<RunRecord>;
 }
 ```
@@ -788,6 +801,9 @@ marks one on the timeline is `generation` changing. Reading a chain costs one
 store read per generation, the same walk `signal` already does; a chain long
 enough for that to matter is one to page over with `list({ tag })` instead.
 
+The dashboard is the screen over this view: a run that has been handed on links
+to its chain, and `?chain=<id>` renders it — see Dashboard.
+
 **When to stop is the workflow's business.** Nothing here caps a chain; the
 `if` that returns instead of continuing is the only thing that ends one. A
 workflow that continues unconditionally is an infinite loop that survives
@@ -987,10 +1003,11 @@ tests/
                         per generation and as one chain,
                         saga compensation, typed signals, step timeouts, tags,
                         and a worker reacting to wakeups a test sends by hand
-  dashboard.test.ts     16 tests driving the handler the way a browser does:
-                        follow the link the list writes, read the timeline, post
-                        the form, follow the redirect — and a `<script>` tag
-                        carried in through an id, a tag, an input and the query
+  dashboard.test.ts     30 tests driving the handler the way a browser does:
+                        follow the link the list writes, read the timeline, open
+                        the chain a generation names, post the form, follow the
+                        redirect — and a `<script>` tag carried in through an
+                        id, a tag, an input and the query
   sqlite.test.ts        11 tests on a real file: a run resumed after the process
                         that started it is gone, stale writes, leases across two
                         connections, keyset paging, and the plan a tag query gets
@@ -1015,13 +1032,13 @@ CI runs the full suite, Postgres included, on every push.
 - **Migrating an in-flight run between versions.** A run finishes on the
   version it started on; there is no hook to rewrite its history onto the next
   one. Keep the old definition registered until those runs drain.
-- **A chain on the run list, and on the dashboard.** `engine.viewChain` reads a
-  chain as one piece of work, but `engine.list` and the screen over it are still
-  a page of runs: a chain of nine generations is nine rows, and the dashboard
-  links to one run's timeline. Collapsing them would mean a listing that reads
-  every row's chain to decide whether to show it, against an index that orders
-  runs and knows nothing about generations. A tag names every generation at
-  once, which is how to get a chain's runs back in one query.
+- **A chain on the run list.** The dashboard reads one — see Dashboard — but
+  `engine.list` and the page of rows over it are still runs: a chain of nine
+  generations is nine rows there, and the chain is a link on one of them rather
+  than a row of its own. Collapsing them would mean a listing that reads every
+  row's chain to decide whether to show it, against an index that orders runs
+  and knows nothing about generations. A tag names every generation at once,
+  which is how to get a chain's runs back in one query.
 - **Every name a run has ever had.** `engine.retag` keeps the set it replaced
   — see Tags — but only `MAX_FORMER_TAGS` of them, so a run renamed more often
   than that has lost its earliest windows and says so by not covering them.

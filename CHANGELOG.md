@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-14
+
+- A chain on the dashboard: `?chain=<id>` renders `engine.viewChain` as a screen — the chain's own input, the outcome the last generation reported and the elapsed time across every handover, then every generation as a row into its own history and all of their events on one axis of offsets from the root — reached from the chain row on a run that has been handed on, which now links to the chain rather than to the root's own record and appears on the root itself once it names a successor; the screen is a read, since `signal` walks to the live generation from either page and a form here would put the CSRF token on a second screen, so it names that generation instead, and the run list is untouched because collapsing chains there would mean reading every row's chain against an index that knows nothing about generations.
+
 ## 2026-10-12
 
 - The history of what a run was called: `engine.retag` keeps the set it replaced and the window the run carried it in, newest first and capped at `MAX_FORMER_TAGS`, so an operator reaching a run by a name the tag index has stopped answering for can tell it is the run they meant and see when it stopped being the one they are describing — surfaced as `view.formerTags` and `view.tagsSince`, and on the dashboard as a since on the tags row and a Former tags section; each entry carries its own start rather than deriving it from the next, so the cap cannot stretch the oldest window back over the renames it dropped, a run given its first name records the empty set it had until then, and a handover copies the names forward without the account of them, which stays on the generation that was renamed.
