@@ -104,13 +104,23 @@ export function dashboard(engine: DashboardEngine, options: DashboardOptions = {
     }
 
     const runId = url.searchParams.get("run");
-    if (runId === null) return html(await listPage(engine, url, { limit, title }));
+    if (runId !== null) {
+      const view = await engine.view(runId);
+      if (!view) return html(notFound(url, title, "run", runId), 404);
+      // Only the run page carries a form that changes anything, so it is the
+      // only request a token is asked for: the filters are a GET, and the
+      // chain below is a read.
+      return html(runPage(view, url, title, csrf ? await csrf.token(request) : null));
+    }
 
-    const view = await engine.view(runId);
-    if (!view) return html(notFound(runId, url, title), 404);
-    // Only the run page carries a form that changes anything, so it is the
-    // only request a token is asked for: the filters are a GET.
-    return html(runPage(view, url, title, csrf ? await csrf.token(request) : null));
+    const chainId = url.searchParams.get("chain");
+    if (chainId !== null) {
+      const view = await engine.viewChain(chainId);
+      if (!view) return html(notFound(url, title, "chain", chainId), 404);
+      return html(chainPage(view, url, title));
+    }
+
+    return html(await listPage(engine, url, { limit, title }));
   };
 }
 
@@ -279,11 +289,17 @@ function runPage(view: RunView, url: URL, title: string, csrfToken: string | nul
     ["blocked on", blocked(view.blockedOn)],
     ["tags", tags(view)],
   ];
-  // Generations count from 1, so a chain is only worth a row once the work has
-  // been handed on at least once — and then the root is the id an operator
-  // most likely arrived holding.
-  if (view.chain.generation > 1) {
-    facts.push(["chain", `${runLink(url, view.chain.root)} <span class="dim">generation ${view.chain.generation}</span>`]);
+  // Generations count from 1, so the work has been handed on at least once if
+  // this is not the first — or, on the root, if it names a successor. Below
+  // that there is no second run to read as one piece of work, and the page in
+  // front of the operator is the whole of it.
+  //
+  // The id is the root's, as the one an operator most likely arrived holding,
+  // but the link is the chain rather than the root's own record: a generation
+  // is rarely the question, and the root's history is one row on from there
+  // along with every other generation's.
+  if (view.chain.generation > 1 || view.continuation) {
+    facts.push(["chain", `${chainLink(url, view.chain.root)} <span class="dim">generation ${view.chain.generation}</span>`]);
   }
   if (view.continuation) facts.push(["continued as", runLink(url, view.continuation.runId)]);
   if (view.error !== null) facts.push(["error", `<span class="failed">${text(view.error)}</span>`]);
@@ -389,6 +405,101 @@ function signalForm(view: RunView, url: URL, csrfToken: string | null): string {
 }
 
 // ---------------------------------------------------------------------------
+// One chain
+
+/**
+ * A continuation chain as the one piece of work it is: the chain's own facts,
+ * every generation as a row into its own history, and all their events on a
+ * single axis of offsets from the root.
+ *
+ * The fields it shares with a run answer about the chain — the root's input,
+ * the outcome the last generation reported, the elapsed time across every
+ * handover — because an operator who arrived holding an order id is asking
+ * what happened to the work, not what happened before the first handover.
+ *
+ * It writes nothing. `engine.signal` walks to the generation doing the work,
+ * so a form here would post exactly what that generation's own page posts —
+ * and that page is one click away, named in the facts. Keeping the only write
+ * on one screen keeps the CSRF token on one screen.
+ */
+function chainPage(view: ChainView, url: URL, title: string): string {
+  const facts: [string, string][] = [
+    ["workflow", text(view.workflow)],
+    ["status", badge(view.status)],
+    ["generations", String(view.generations)],
+    // The generation `signal` and `cancel` reach, which is the run an operator
+    // reading a chain has come here to act on.
+    ["live", runLink(url, view.live)],
+    ["started", text(stamp(view.createdAt))],
+    ["duration", text(elapsed(view.durationMs))],
+    ["blocked on", blocked(view.blockedOn)],
+    ["tags", view.tags.length ? view.tags.map((t) => `<span class="tag">${text(t)}</span>`).join(" ") : dim("—")],
+  ];
+  if (view.error !== null) facts.push(["error", `<span class="failed">${text(view.error)}</span>`]);
+
+  const generations = view.runs.map(
+    (run) => `<tr>
+      <td class="num">${run.chain.generation}</td>
+      <td>${runLink(url, run.id)}</td>
+      <td>${badge(run.status)}</td>
+      <td class="num">${text(stamp(run.createdAt))}</td>
+      <td class="num">${text(elapsed(run.durationMs))}</td>
+    </tr>`,
+  );
+
+  const events = view.timeline.map(
+    (entry) => `<tr>
+      <td class="num">${entry.generation}</td>
+      <td class="num">${text(elapsed(entry.elapsedMs))}</td>
+      <td class="num">${entry.call}</td>
+      <td><code>${text(entry.type)}</code></td>
+      <td>${text(entry.summary)}</td>
+    </tr>`,
+  );
+
+  return document(`${view.workflow} · ${view.root}`, [
+    `<p class="pager"><a href="${text(link(url))}">← all runs</a></p>`,
+    `<h1>${text(view.workflow)} <code class="dim">${text(view.root)}</code></h1>`,
+    `<dl>${facts.map(([k, v]) => `<dt>${text(k)}</dt><dd>${v}</dd>`).join("")}</dl>`,
+    section("Input", json(view.input)),
+    view.status === "completed" ? section("Output", json(view.output)) : "",
+    `<h2>Generations</h2><table>
+      <thead><tr><th class="num">gen</th><th>run</th><th>status</th><th>started</th><th>duration</th></tr></thead>
+      <tbody>${generations.join("")}</tbody>
+    </table>`,
+    chainTimeline(view, events),
+    `<footer class="dim">${text(title)}</footer>`,
+  ]);
+}
+
+/**
+ * Every generation's events in order, each saying which one it is recorded on.
+ * A handover leaves no event of its own — nothing replays it — so the only
+ * thing that marks one here is the generation changing.
+ */
+function chainTimeline(view: ChainView, rows: string[]): string {
+  // The run page's caveat, said per generation it applies to: on one axis a
+  // compacted generation's missing attempts read as a quiet stretch of the
+  // work rather than of a run, which is the wrong thing to conclude from them.
+  const compacted = view.runs.filter((run) => run.compaction !== null);
+  const which = compacted.map((run) => run.chain.generation).join(", ");
+  const dropped = compacted.reduce((total, run) => total + (run.compaction?.droppedEvents ?? 0), 0);
+  const caveat =
+    compacted.length === 0
+      ? ""
+      : `<p class="dim">History was compacted on ${compacted.length === 1 ? "generation" : "generations"}
+         ${text(which)}: ${dropped} superseded attempt(s) are no longer on record.</p>`;
+  const body =
+    rows.length === 0
+      ? `<p class="dim">Nothing has happened yet.</p>`
+      : `<table>
+          <thead><tr><th class="num">gen</th><th>at</th><th>call</th><th>type</th><th>what happened</th></tr></thead>
+          <tbody>${rows.join("")}</tbody>
+        </table>`;
+  return `<h2>Timeline</h2>${caveat}${body}`;
+}
+
+// ---------------------------------------------------------------------------
 // HTML
 
 /**
@@ -404,11 +515,11 @@ function refused(url: URL, title: string): string {
   ]);
 }
 
-function notFound(runId: string, url: URL, title: string): string {
+function notFound(url: URL, title: string, what: "run" | "chain", id: string): string {
   return document(title, [
     `<p class="pager"><a href="${text(link(url))}">← all runs</a></p>`,
-    `<h1>No such run</h1>`,
-    `<p>Nothing is stored under <code>${text(runId)}</code>.</p>`,
+    `<h1>No such ${text(what)}</h1>`,
+    `<p>Nothing is stored under <code>${text(id)}</code>.</p>`,
   ]);
 }
 
@@ -471,6 +582,11 @@ function blocked(on: RunBlockedOn | null): string {
 
 function runLink(url: URL, runId: string): string {
   return `<a href="${text(`${link(url)}?run=${encodeURIComponent(runId)}`)}"><code>${text(runId)}</code></a>`;
+}
+
+/** The chain a run belongs to, named by its root — which is how `?chain=` reads it. */
+function chainLink(url: URL, rootId: string): string {
+  return `<a href="${text(`${link(url)}?chain=${encodeURIComponent(rootId)}`)}"><code>${text(rootId)}</code></a>`;
 }
 
 function json(value: unknown): string {
