@@ -40,6 +40,11 @@ export interface DashboardOptions {
    * a rule not to route to it from the public internet.
    */
   csrf?: DashboardCsrf;
+  /**
+   * Let the screen end a run. Absent, it cannot: there is no button and a
+   * post asking for one is refused, which is where this screen started.
+   */
+  cancel?: DashboardCancel;
 }
 
 /**
@@ -62,6 +67,22 @@ export interface DashboardCsrf {
   /** Whether the token that came back with a post is the one its session was given. */
   verify(request: Request, token: string): boolean | Promise<boolean>;
 }
+
+/**
+ * Ending a run, handed over by whoever mounts the dashboard.
+ *
+ * It is not on `DashboardEngine` with the reads and the signal, because it is
+ * not the same kind of act: a signal is a message the workflow already asked
+ * for and handles on a path it defines, and a cancel is an operator ending the
+ * run from outside its own logic. So the screen cannot reach for it — the
+ * layer that decided this operator may do that passes it in, at the call site
+ * where the decision is written down and greppable.
+ *
+ * The result is awaited and otherwise ignored: what the operator is told is
+ * the run, re-read on the page they land back on. Throwing is how this says no
+ * — the message goes to them as it came.
+ */
+export type DashboardCancel = (id: string) => unknown;
 
 /** The form field the token travels in, and the only name a host has to know. */
 const CSRF_FIELD = "_csrf";

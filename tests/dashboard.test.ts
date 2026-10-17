@@ -560,3 +560,145 @@ describe("dashboard CSRF", () => {
     expect((await engine.view(id))?.status).toBe("completed");
   });
 });
+
+/**
+ * Ending a run from the screen, with the call the mounting layer hands over.
+ * The capability is the whole subject here: every test is either a dashboard
+ * that was given one, or one that was not and therefore cannot.
+ */
+describe("dashboard cancel", () => {
+  /** A waiting run, which is the only state a run can be ended from. */
+  async function waiting() {
+    const { engine, advance } = harness([fulfilment]);
+    const id = await engine.start(fulfilment, { order: "ord_1" }, { id: "run-1" });
+    await engine.settle(id);
+    advance(1_000);
+    await engine.settle(id);
+    return { engine, id };
+  }
+
+  function cancelPost(fields: Record<string, string> = {}): Request {
+    return post({ action: "cancel", run: "run-1", ...fields });
+  }
+
+  it("offers no button, and takes no post, without the option", async () => {
+    const { engine, id } = await waiting();
+    const handler = engine.dashboard();
+
+    const body = await (await handler(get("?run=run-1"))).text();
+    expect(body).not.toContain('value="cancel"');
+    expect(body).not.toContain("Cancel run");
+
+    // The post is the half that matters: a form the screen never rendered is
+    // the one an operator who wants this writes by hand, and the capability
+    // has to be what refuses it rather than the absence of a button.
+    const response = await handler(cancelPost());
+    expect(response.status).toBe(303);
+    expect(response.headers.get("location")).toBe(
+      "/ops/workflows?run=run-1&error=this+dashboard+cannot+cancel+runs",
+    );
+    expect((await engine.view(id))?.status).toBe("waiting");
+  });
+
+  it("ends the run with the call it was given, and says so on the page it lands on", async () => {
+    const { engine, id } = await waiting();
+    const asked: string[] = [];
+    const handler = engine.dashboard({ cancel: (runId) => (asked.push(runId), engine.cancel(runId)) });
+
+    const response = await handler(cancelPost());
+
+    expect(asked).toEqual(["run-1"]);
+    expect(response.status).toBe(303);
+    expect(response.headers.get("location")).toBe("/ops/workflows?run=run-1&canceled=1");
+    expect((await engine.view(id))?.status).toBe("canceled");
+
+    const body = await (await handler(get("?run=run-1&canceled=1"))).text();
+    expect(body).toContain("This run was canceled");
+  });
+
+  it("offers the button on a live run, and withdraws it once there is nothing to end", async () => {
+    const { engine } = await waiting();
+    const handler = engine.dashboard({ cancel: (id) => engine.cancel(id) });
+
+    const live = await (await handler(get("?run=run-1"))).text();
+    expect(live).toContain('<input type="hidden" name="action" value="cancel" />');
+    expect(live).toContain("Cancel run");
+
+    await handler(cancelPost());
+
+    // Terminal, so the same reason the signal form stands down applies: there
+    // is no run left to act on, and a button that cannot do anything is worse
+    // than none during the incident it is read in.
+    const ended = await (await handler(get("?run=run-1"))).text();
+    expect(ended).not.toContain('value="cancel"');
+    expect(ended).toContain("it cannot be signalled");
+  });
+
+  it("reports what the call refused, as the operator's own mistake", async () => {
+    const { engine, id } = await waiting();
+    const handler = engine.dashboard({
+      cancel: () => {
+        throw new Error("alice may not cancel this tenant's runs");
+      },
+    });
+
+    const response = await handler(cancelPost());
+
+    expect(response.status).toBe(303);
+    expect(response.headers.get("location")).toContain("error=alice+may+not+cancel");
+    expect((await engine.view(id))?.status).toBe("waiting");
+  });
+
+  it("is checked for CSRF like any other post, and fails closed", async () => {
+    const { engine, id } = await waiting();
+    const asked: string[] = [];
+    const handler = engine.dashboard({
+      cancel: (runId) => (asked.push(runId), engine.cancel(runId)),
+      csrf: { token: () => "tok-alice", verify: (_request, token) => token === "tok-alice" },
+    });
+
+    for (const fields of [{}, { _csrf: "tok-mallory" }]) {
+      const response = await handler(cancelPost(fields));
+      expect(response.status).toBe(403);
+      expect(await response.text()).toContain("did not come from this session");
+    }
+
+    // The destructive post is the one a cross-site form would be written for,
+    // so the capability must not be reachable past the token check at all.
+    expect(asked).toEqual([]);
+    expect((await engine.view(id))?.status).toBe("waiting");
+
+    const accepted = await handler(cancelPost({ _csrf: "tok-alice" }));
+    expect(accepted.status).toBe(303);
+    expect((await engine.view(id))?.status).toBe("canceled");
+  });
+
+  it("carries the token in the cancel form too, not only the signal one", async () => {
+    const { engine } = await waiting();
+    const handler = engine.dashboard({
+      cancel: (id) => engine.cancel(id),
+      csrf: { token: () => "tok-alice", verify: () => true },
+    });
+
+    const body = await (await handler(get("?run=run-1"))).text();
+
+    // Both forms post to the same handler behind the same check, so a token on
+    // one and not the other is a button that cannot work.
+    const forms = body.split("<form").filter((part) => part.includes('method="post"'));
+    expect(forms).toHaveLength(2);
+    for (const form of forms) expect(form).toContain('name="_csrf" value="tok-alice"');
+  });
+
+  it("leaves the signal form alone: a post without the action still signals", async () => {
+    const { engine, id } = await waiting();
+    const asked: string[] = [];
+    const handler = engine.dashboard({ cancel: (runId) => (asked.push(runId), engine.cancel(runId)) });
+
+    const response = await handler(post({ run: "run-1", signal: "review", payload: '{"approved":true}' }));
+
+    expect(response.status).toBe(303);
+    expect(response.headers.get("location")).toBe("/ops/workflows?run=run-1&sent=review");
+    expect(asked).toEqual([]);
+    expect((await engine.view(id))?.status).toBe("completed");
+  });
+});

@@ -71,7 +71,7 @@ export type { ChainTimelineEntry, ChainView, RunBlockedOn, RunView, TimelineEntr
 
 // The admin screen over that view: one fetch handler, self-contained HTML.
 export { DASHBOARD_LIMIT, dashboard } from "./dashboard.js";
-export type { DashboardCsrf, DashboardEngine, DashboardHandler, DashboardOptions } from "./dashboard.js";
+export type { DashboardCancel, DashboardCsrf, DashboardEngine, DashboardHandler, DashboardOptions } from "./dashboard.js";
 
 // For re-delivering a child's outcome by hand: the signal its parent waits on.
 export { childSignal } from "./children.js";
