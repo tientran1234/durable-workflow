@@ -1,3 +1,4 @@
+import { TERMINAL } from "./due.js";
 import { pageLimit } from "./list.js";
 import type { RunPage, RunQuery, RunRecord, RunStatus } from "./types.js";
 import type { ChainView, RunBlockedOn, RunView, TimelineEntry } from "./view.js";
@@ -87,6 +88,13 @@ export type DashboardCancel = (id: string) => unknown;
 /** The form field the token travels in, and the only name a host has to know. */
 const CSRF_FIELD = "_csrf";
 
+/**
+ * Which post this is. Absent means a signal, so the form that has always been
+ * on this page posts exactly the fields it always did.
+ */
+const ACTION_FIELD = "action";
+const CANCEL_ACTION = "cancel";
+
 /** A page small enough to read on one screen, which is what this is for. */
 export const DASHBOARD_LIMIT = 25;
 
@@ -119,7 +127,7 @@ export function dashboard(engine: DashboardEngine, options: DashboardOptions = {
   return async (request: Request): Promise<Response> => {
     const url = new URL(request.url);
 
-    if (request.method === "POST") return send(engine, request, url, csrf, title);
+    if (request.method === "POST") return posted(engine, request, url, { csrf, title, cancel: options.cancel });
     if (request.method !== "GET" && request.method !== "HEAD") {
       return new Response("method not allowed", { status: 405, headers: { allow: "GET, HEAD, POST" } });
     }
@@ -131,7 +139,7 @@ export function dashboard(engine: DashboardEngine, options: DashboardOptions = {
       // Only the run page carries a form that changes anything, so it is the
       // only request a token is asked for: the filters are a GET, and the
       // chain below is a read.
-      return html(runPage(view, url, title, csrf ? await csrf.token(request) : null));
+      return html(runPage(view, url, title, csrf ? await csrf.token(request) : null, options.cancel !== undefined));
     }
 
     const chainId = url.searchParams.get("chain");
@@ -146,7 +154,34 @@ export function dashboard(engine: DashboardEngine, options: DashboardOptions = {
 }
 
 // ---------------------------------------------------------------------------
-// Sending a signal
+// The two posts
+
+/**
+ * Every post this screen takes, through one door: the form is read once and
+ * the token checked once, so a write added here cannot be the one that forgot
+ * to ask.
+ *
+ * The check comes before anything is read out of the form, and is answered as
+ * a page rather than the redirect an operator's own mistakes get: a post this
+ * session did not make has no run page to be sent back to, and the browser
+ * that made it is not the one looking.
+ */
+async function posted(
+  engine: DashboardEngine,
+  request: Request,
+  url: URL,
+  mount: { csrf: DashboardCsrf | undefined; title: string; cancel: DashboardCancel | undefined },
+): Promise<Response> {
+  const form = await request.formData();
+
+  if (mount.csrf && !(await accepted(mount.csrf, request, String(form.get(CSRF_FIELD) ?? "")))) {
+    return html(refused(url, mount.title), 403);
+  }
+
+  return String(form.get(ACTION_FIELD) ?? "") === CANCEL_ACTION
+    ? end(form, url, mount.cancel)
+    : send(engine, form, url);
+}
 
 /**
  * Deliver the signal form, then redirect to the run it was sent to.
@@ -155,30 +190,12 @@ export function dashboard(engine: DashboardEngine, options: DashboardOptions = {
  * is exactly what somebody watching a run they just resumed does — re-reads
  * the run instead of sending the signal a second time.
  */
-async function send(
-  engine: DashboardEngine,
-  request: Request,
-  url: URL,
-  csrf: DashboardCsrf | undefined,
-  title: string,
-): Promise<Response> {
-  const form = await request.formData();
-
-  // Before anything is read out of the form, and answered as a page rather
-  // than the redirect an operator's own mistakes get: a post this session did
-  // not make has no run page to be sent back to, and the browser that made it
-  // is not the one looking.
-  if (csrf && !(await accepted(csrf, request, String(form.get(CSRF_FIELD) ?? "")))) {
-    return html(refused(url, title), 403);
-  }
-
+async function send(engine: DashboardEngine, form: FormData, url: URL): Promise<Response> {
   const runId = String(form.get("run") ?? "");
   const name = String(form.get("signal") ?? "").trim();
   const body = String(form.get("payload") ?? "").trim();
 
-  const back = new URL(url);
-  back.search = "";
-  back.searchParams.set("run", runId);
+  const back = runPageUrl(url, runId);
 
   if (!runId || !name) {
     back.searchParams.set("error", "a run id and a signal name are required");
@@ -204,6 +221,48 @@ async function send(
     back.searchParams.set("error", err instanceof Error ? err.message : String(err));
   }
   return seeOther(back);
+}
+
+/**
+ * End the run the form names, if ending one is something this screen was
+ * handed. Post/redirect/get like a signal, so the operator reads the outcome
+ * off the run itself rather than off this response.
+ */
+async function end(form: FormData, url: URL, cancel: DashboardCancel | undefined): Promise<Response> {
+  const runId = String(form.get("run") ?? "");
+  const back = runPageUrl(url, runId);
+
+  if (!cancel) {
+    // No page here offers this, so a post that arrives asking for it was
+    // written by hand against a screen that was never given the call. Said as
+    // a message on the run rather than silently: somebody is holding a form
+    // that looks like it works, and the honest answer is that this mount
+    // cannot do it, not that nothing happened.
+    back.searchParams.set("error", "this dashboard cannot cancel runs");
+    return seeOther(back);
+  }
+  if (!runId) {
+    back.searchParams.set("error", "a run id is required");
+    return seeOther(back);
+  }
+
+  try {
+    await cancel(runId);
+    back.searchParams.set("canceled", "1");
+  } catch (err) {
+    // The layer that handed the call over is also the one entitled to refuse
+    // it for this operator, so its message is theirs to read.
+    back.searchParams.set("error", err instanceof Error ? err.message : String(err));
+  }
+  return seeOther(back);
+}
+
+/** The run's own page, which is where every post lands the operator back on. */
+function runPageUrl(url: URL, runId: string): URL {
+  const back = new URL(url);
+  back.search = "";
+  back.searchParams.set("run", runId);
+  return back;
 }
 
 /**
@@ -298,9 +357,10 @@ function nextPageLink(url: URL, cursor: string): string {
 // ---------------------------------------------------------------------------
 // One run
 
-function runPage(view: RunView, url: URL, title: string, csrfToken: string | null): string {
+function runPage(view: RunView, url: URL, title: string, csrfToken: string | null, canCancel: boolean): string {
   const sent = url.searchParams.get("sent");
   const error = url.searchParams.get("error");
+  const canceled = url.searchParams.get("canceled") !== null;
 
   const facts: [string, string][] = [
     ["workflow", `${text(view.workflow)} <span class="dim">v${view.workflowVersion}</span>`],
@@ -344,6 +404,7 @@ function runPage(view: RunView, url: URL, title: string, csrfToken: string | nul
     `<p class="pager"><a href="${text(link(url))}">← all runs</a></p>`,
     `<h1>${text(view.workflow)} <code class="dim">${text(view.id)}</code></h1>`,
     sent === null ? "" : banner("ok", `signal "${sent}" sent`),
+    canceled ? banner("ok", "This run was canceled; nothing it had done has been undone.") : "",
     error === null ? "" : banner("error", error),
     `<dl>${facts.map(([k, v]) => `<dt>${text(k)}</dt><dd>${v}</dd>`).join("")}</dl>`,
     section("Input", json(view.input)),
@@ -352,6 +413,7 @@ function runPage(view: RunView, url: URL, title: string, csrfToken: string | nul
     formerTags(view.formerTags),
     timeline(view, rows),
     signalForm(view, url, csrfToken),
+    canCancel ? cancelForm(view, url, csrfToken) : "",
     `<footer class="dim">${text(title)}</footer>`,
   ]);
 }
@@ -410,11 +472,11 @@ function rejected(signals: RunView["rejectedSignals"]): string {
 }
 
 function signalForm(view: RunView, url: URL, csrfToken: string | null): string {
-  if (["completed", "failed", "canceled", "continued"].includes(view.status)) {
+  if (TERMINAL.has(view.status)) {
     return `<h2>Send a signal</h2><p class="dim">This run is ${text(view.status)}; it cannot be signalled.</p>`;
   }
   const waiting = view.blockedOn?.kind === "signal" ? view.blockedOn.name : "";
-  const token = csrfToken === null ? "" : `<input type="hidden" name="${CSRF_FIELD}" value="${text(csrfToken)}" />`;
+  const token = csrfToken === null ? "" : hidden(CSRF_FIELD, csrfToken);
   return `<h2>Send a signal</h2>
     <form class="signal" method="post" action="${text(link(url))}">
       ${token}
@@ -422,6 +484,30 @@ function signalForm(view: RunView, url: URL, csrfToken: string | null): string {
       <label>name <input type="text" name="signal" value="${text(waiting)}" placeholder="manual-review" required /></label>
       <label>payload <textarea name="payload" rows="4" placeholder="JSON, or leave empty for null"></textarea></label>
       <button type="submit">Send</button>
+    </form>`;
+}
+
+/**
+ * The button, on a dashboard that was given the call and a run there is still
+ * something to end.
+ *
+ * It says what cancelling does not do, because the only thing an operator can
+ * conclude from a saga's steps in the timeline above is the opposite: a
+ * canceled run executes nothing further, and the undos it owes only exist
+ * inside a pass that replays its function, so this unwinds none of them. A run
+ * that has to come apart cleanly is signalled, and takes that path itself.
+ */
+function cancelForm(view: RunView, url: URL, csrfToken: string | null): string {
+  if (TERMINAL.has(view.status)) return "";
+  return `<h2>Cancel this run</h2>
+    <p class="dim">The run stops where it is and runs nothing further. Steps it has already
+    completed stay done: compensations do not run, so a run that has to come apart cleanly
+    wants a signal and the path the workflow takes on it.</p>
+    <form class="cancel" method="post" action="${text(link(url))}">
+      ${csrfToken === null ? "" : hidden(CSRF_FIELD, csrfToken)}
+      ${hidden(ACTION_FIELD, CANCEL_ACTION)}
+      ${hidden("run", view.id)}
+      <button class="danger" type="submit">Cancel run</button>
     </form>`;
 }
 
@@ -583,6 +669,11 @@ ${parts.filter((p) => p !== "").join("\n")}
 `;
 }
 
+/** A field the browser carries back untouched, escaped like any other value. */
+function hidden(name: string, value: string): string {
+  return `<input type="hidden" name="${text(name)}" value="${text(value)}" />`;
+}
+
 function heading(title: string, url: URL): string {
   return `<h1><a href="${text(link(url))}">${text(title)}</a></h1>`;
 }
@@ -701,6 +792,8 @@ input, select, textarea, button { font: inherit; padding: .35rem .5rem; border-r
   border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
 textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; resize: vertical; }
 button { cursor: pointer; background: var(--accent); border-color: var(--accent); color: #fff; align-self: flex-start; }
+button.danger { background: #dc2626; border-color: #dc2626; }
+.cancel { margin: 0 0 1.5rem; }
 .banner { padding: .5rem .75rem; border-radius: 6px; border: 1px solid var(--line); }
 .banner.ok { border-color: #15803d55; color: #15803d; }
 .banner.error { border-color: #dc262655; color: #dc2626; }
