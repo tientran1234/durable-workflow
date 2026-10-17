@@ -548,13 +548,14 @@ Bun.serve({ fetch: admin });                                  // or Deno.serve, 
 app.all("/ops/workflows/*", (c) => admin(c.req.raw));         // or a route in whatever you have
 ```
 
-What it serves is four screens and one action: the run list, filtered by
+What it serves is four screens and two actions: the run list, filtered by
 workflow, status and tag and paged by the same cursor `engine.list` returns;
 one run, with its facts, its input and output, the names it has been renamed
 out of, and its history as the timeline `engine.view` renders; the continuation
 chain that run belongs to, as `engine.viewChain` reads it; and a form that
 sends a signal to the run you are looking at, pre-filled with the name it is
-waiting for.
+waiting for, and — where the layer that mounted it handed the call over — a
+button that ends that run.
 
 Each response is one self-contained HTML document — styles inline, no scripts,
 no assets to host, every action a link or a form. There is nothing to build and
@@ -563,7 +564,7 @@ is a dashboard nobody has during the incident.
 
 It never has to be told where it is mounted. Routing is entirely in the query
 string — `?run=<id>` is one run, `?chain=<id>` the chain it belongs to, no
-query is the list, a POST sends a signal — so the links it writes are relative
+query is the list, a POST signals a run or ends it — so the links it writes are relative
 to the path the request arrived on, and the same handler works at
 `/ops/workflows`, at the root, or behind a proxy that rewrites neither.
 
@@ -598,7 +599,8 @@ export interface DashboardEngine {
 ```
 
 It takes that interface rather than an `Engine`, so the screen can only do what
-an operator should: there is no `cancel` on it and no store behind it. Mount it
+an operator should: there is no `cancel` on it and no store behind it — ending
+a run is a separate grant, below. Mount it
 on a path your admin surface already authenticates — **it authenticates nobody
 itself**, it reads every run's input and output, and it can resume a run.
 
@@ -623,6 +625,30 @@ mistakes, to be read on the run page they came from, and this is a request
 whose browser is not looking at this screen. It fails closed — a missing
 field is no token, and a `verify` that throws has not said yes. Without the
 option nothing is checked, which is where this screen started.
+
+That layer also owns the decision that an operator may end a run, so ending one
+is a grant of the same kind: a call it hands over rather than a method the
+screen can reach for.
+
+```ts
+const admin = engine.dashboard({
+  csrf: { token, verify },
+  cancel: (id) => engine.cancel(id),          // or throw, and the operator reads why not
+});
+```
+
+A run that is still going then carries a **Cancel run** button, posting behind
+the same token check the signal form posts behind. Mounted without the option
+there is no button and a post asking for one is refused, so the grant is a line
+at the call site rather than a property of this screen. What the button does is
+what `engine.cancel` does, which is less than an operator pressing it may
+assume: the run stops where it is and runs nothing further, and the
+compensations a saga owes only exist inside a pass that replays its function,
+so none of them run and nothing already done is undone. A run that has to come
+apart cleanly wants a signal and the path the workflow takes on it — the form
+says so, next to the button. Throwing from `cancel` is how that layer refuses
+one operator what it allows another; the message comes back on the run page as
+their own mistakes do.
 
 ## Hooks
 
@@ -1003,7 +1029,7 @@ tests/
                         per generation and as one chain,
                         saga compensation, typed signals, step timeouts, tags,
                         and a worker reacting to wakeups a test sends by hand
-  dashboard.test.ts     30 tests driving the handler the way a browser does:
+  dashboard.test.ts     37 tests driving the handler the way a browser does:
                         follow the link the list writes, read the timeline, open
                         the chain a generation names, post the form, follow the
                         redirect — and a `<script>` tag carried in through an
@@ -1076,13 +1102,17 @@ CI runs the full suite, Postgres included, on every push.
   refusal. A dashboard mounted without it takes a cross-site post as it always
   did, which makes the rule the same rule: do not route to it from the public
   internet.
-- **Cancelling, retrying or editing a run from the dashboard.** The screen can
-  send a signal and nothing else. A signal is a message the workflow already
-  asked for and handles on a path it defines; a cancel button is an operator
-  ending a run from outside its own logic, and a retry button is an operator
-  deciding a step's policy was wrong after the fact. Both are `Engine` calls
-  with consequences worth writing down at the call site, which is why the
-  dashboard takes `DashboardEngine` and not an engine.
+- **Retrying or editing a run from the dashboard, and cancelling one on a
+  mount that was not given the call.** A signal is a message the workflow
+  already asked for and handles on a path it defines; ending a run is an
+  operator acting from outside its own logic, which is why `cancel` is not on
+  `DashboardEngine` — see Dashboard — but handed to the mount by the layer that
+  decided this operator may do it, leaving a screen without it no button and no
+  post to take. A retry button is an operator deciding a step's policy was
+  wrong after the fact, and editing a run is editing the history a replay is
+  about to read back as what already happened. Both stay `Engine` calls, with
+  consequences worth writing down at a call site rather than behind a button on
+  a screen an incident is being read through.
 - **A dashboard that updates itself.** Each response is a document, so a run
   moving on is a refresh. Live state means a socket or a poll loop, which means
   scripts, which means the one thing this is not: something to build and host

@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-17
+
+- Ending a run from the dashboard: `dashboard(engine, { cancel })` puts a Cancel run button on a run that is still going and refuses the post on a mount that was given no such call, so an operator who has decided a run will not finish ends it from the screen that shows them what it is stuck on instead of leaving the incident to reach for an engine — the call is handed over by the layer that owns the session and the decision rather than taken from `DashboardEngine`, which stays the three reads and the signal, and it is reached only past the same CSRF check the signal form posts behind, since the destructive post is the one a cross-site form would be written for; every post now goes through one door that reads the form and verifies the token once, a post with no action field is the signal it always was, both forms stand down on `TERMINAL`, and the form says what cancelling does not do, because compensations live inside a pass that replays the run's function and so none of them run.
+
 ## 2026-10-14
 
 - A chain on the dashboard: `?chain=<id>` renders `engine.viewChain` as a screen — the chain's own input, the outcome the last generation reported and the elapsed time across every handover, then every generation as a row into its own history and all of their events on one axis of offsets from the root — reached from the chain row on a run that has been handed on, which now links to the chain rather than to the root's own record and appears on the root itself once it names a successor; the screen is a read, since `signal` walks to the live generation from either page and a form here would put the CSRF token on a second screen, so it names that generation instead, and the run list is untouched because collapsing chains there would mean reading every row's chain against an index that knows nothing about generations.
