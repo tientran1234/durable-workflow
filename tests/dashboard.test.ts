@@ -702,3 +702,106 @@ describe("dashboard cancel", () => {
     expect((await engine.view(id))?.status).toBe("completed");
   });
 });
+
+/**
+ * The tag that re-reads a screen, and the screens it is kept off. Every test
+ * here asks for an interval and then looks in the head of the document,
+ * because that is the whole of this: one meta element the browser acts on.
+ */
+describe("dashboard refresh", () => {
+  /** Two generations, the last of them waiting: a chain that is still moving. */
+  const relay = defineWorkflow<{ left: number }, string>("relayed", async (ctx, input) => {
+    await ctx.step(`leg-${input.left}`, () => input.left);
+    if (input.left > 1) return ctx.continueAsNew({ left: input.left - 1 });
+    return ctx.waitFor<string>("baton");
+  });
+
+  /** One of each screen: a run waiting on a signal, and a live chain. */
+  async function screens() {
+    const h = harness([fulfilment, relay]);
+    const run = await h.engine.start(fulfilment, { order: "ord_1" }, { id: "run-1" });
+    await h.engine.settle(run);
+    h.advance(1_000);
+    await h.engine.settle(run);
+    await h.engine.start(relay, { left: 2 }, { id: "r1" });
+    await h.drain();
+    return h;
+  }
+
+  const head = (body: string) => body.slice(0, body.indexOf("</head>"));
+
+  it("writes no refresh anywhere unless the mount asks for one", async () => {
+    const { engine } = await screens();
+    const handler = engine.dashboard();
+
+    for (const path of ["", "?run=run-1", "?chain=r1"]) {
+      expect(await (await handler(get(path))).text()).not.toContain("http-equiv");
+    }
+  });
+
+  it("re-reads the list and the chain on the interval it was given", async () => {
+    const { engine } = await screens();
+    const handler = engine.dashboard({ refreshSeconds: 15 });
+
+    for (const path of ["", "?chain=r1"]) {
+      const body = await (await handler(get(path))).text();
+      expect(head(body)).toContain('<meta http-equiv="refresh" content="15" />');
+      // And that is all of it: one document still, with nothing to host.
+      expect(body).not.toContain("<script");
+    }
+  });
+
+  it("leaves the run page still, because the signal box is on it", async () => {
+    const { engine } = await screens();
+    const handler = engine.dashboard({ refreshSeconds: 15 });
+
+    const body = await (await handler(get("?run=run-1"))).text();
+
+    // The guarantee: a reload here would take the payload the operator is
+    // halfway through typing with it.
+    expect(body).toContain("<textarea");
+    expect(body).not.toContain("http-equiv");
+  });
+
+  it("stops re-reading a chain that has ended", async () => {
+    const h = await screens();
+    const handler = h.engine.dashboard({ refreshSeconds: 15 });
+
+    await h.engine.signal("r1", "baton", "handed over");
+    await h.drain();
+
+    const body = await (await handler(get("?chain=r1"))).text();
+
+    // Nothing will happen on it again, so a browser asking every fifteen
+    // seconds is asking a question that has been answered.
+    expect(body).toContain("completed");
+    expect(body).not.toContain("http-equiv");
+  });
+
+  it("keeps it off a screen with nothing on it to watch", async () => {
+    const { engine } = await screens();
+    const refused = engine.dashboard({ refreshSeconds: 15, csrf: { token: () => "tok", verify: () => false } });
+
+    const missing = await (await engine.dashboard({ refreshSeconds: 15 })(get("?run=no-such-run"))).text();
+    const post403 = await (await refused(post({ run: "run-1", signal: "review" }))).text();
+
+    expect(missing).toContain("No such run");
+    expect(missing).not.toContain("http-equiv");
+    expect(post403).toContain("did not come from this session");
+    expect(post403).not.toContain("http-equiv");
+  });
+
+  it("reads an interval under a second as off, and the rest as whole seconds", async () => {
+    const { engine } = await screens();
+
+    for (const refreshSeconds of [0, -15, 0.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const body = await (await engine.dashboard({ refreshSeconds })(get())).text();
+      // Clamping a typo up to one second would make it a reload the operator
+      // on the other end cannot stop.
+      expect(body).not.toContain("http-equiv");
+    }
+
+    const body = await (await engine.dashboard({ refreshSeconds: 9.7 })(get())).text();
+    expect(head(body)).toContain('content="9"');
+  });
+});

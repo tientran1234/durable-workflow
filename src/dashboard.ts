@@ -46,6 +46,17 @@ export interface DashboardOptions {
    * post asking for one is refused, which is where this screen started.
    */
   cancel?: DashboardCancel;
+  /**
+   * Re-read the screens that only read, this often, through a
+   * `<meta http-equiv="refresh">` and nothing else — no socket, no poll loop,
+   * no script, and the same document a refresh has always served. Absent, a
+   * run moving on is the operator pressing F5, which is where this started.
+   *
+   * It reaches the run list and the chain. Not the run page: that is the one
+   * screen with a box an operator types a signal payload into, and a document
+   * that replaces itself takes what is half-typed in it with it.
+   */
+  refreshSeconds?: number;
 }
 
 /**
