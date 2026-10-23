@@ -134,6 +134,7 @@ export function dashboard(engine: DashboardEngine, options: DashboardOptions = {
   const limit = pageLimit(options.limit ?? DASHBOARD_LIMIT);
   const title = options.title ?? "durable-workflow";
   const csrf = options.csrf;
+  const refresh = refreshInterval(options.refreshSeconds);
 
   return async (request: Request): Promise<Response> => {
     const url = new URL(request.url);
@@ -149,7 +150,9 @@ export function dashboard(engine: DashboardEngine, options: DashboardOptions = {
       if (!view) return html(notFound(url, title, "run", runId), 404);
       // Only the run page carries a form that changes anything, so it is the
       // only request a token is asked for: the filters are a GET, and the
-      // chain below is a read.
+      // chain below is a read. It is also why no refresh is written here — a
+      // document that replaces itself takes the payload being typed into that
+      // form with it.
       return html(runPage(view, url, title, csrf ? await csrf.token(request) : null, options.cancel !== undefined));
     }
 
@@ -157,10 +160,12 @@ export function dashboard(engine: DashboardEngine, options: DashboardOptions = {
     if (chainId !== null) {
       const view = await engine.viewChain(chainId);
       if (!view) return html(notFound(url, title, "chain", chainId), 404);
-      return html(chainPage(view, url, title));
+      // A chain whose live generation has ended will not gain another, so the
+      // document in front of the operator is already the last one there is.
+      return html(chainPage(view, url, title, TERMINAL.has(view.status) ? null : refresh));
     }
 
-    return html(await listPage(engine, url, { limit, title }));
+    return html(await listPage(engine, url, { limit, title, refresh }));
   };
 }
 
@@ -293,7 +298,11 @@ async function accepted(csrf: DashboardCsrf, request: Request, token: string): P
 // ---------------------------------------------------------------------------
 // The list
 
-async function listPage(engine: DashboardEngine, url: URL, chrome: { limit: number; title: string }): Promise<string> {
+async function listPage(
+  engine: DashboardEngine,
+  url: URL,
+  chrome: { limit: number; title: string; refresh: number | null },
+): Promise<string> {
   const workflow = url.searchParams.get("workflow")?.trim() ?? "";
   const status = url.searchParams.get("status")?.trim() ?? "";
   const tag = url.searchParams.get("tag")?.trim() ?? "";
@@ -312,11 +321,15 @@ async function listPage(engine: DashboardEngine, url: URL, chrome: { limit: numb
     // A cursor is opaque and arrives in a URL somebody may have edited or
     // kept, so a listing that cannot be answered is a message on the filter
     // form rather than a 500 over the whole screen.
-    return document(chrome.title, [
-      heading(chrome.title, url),
-      filters(url, { workflow, status, tag }),
-      banner("error", err instanceof Error ? err.message : String(err)),
-    ]);
+    return document(
+      chrome.title,
+      [
+        heading(chrome.title, url),
+        filters(url, { workflow, status, tag }),
+        banner("error", err instanceof Error ? err.message : String(err)),
+      ],
+      chrome.refresh,
+    );
   }
 
   const rows = page.runs.map((run) => {
@@ -333,16 +346,20 @@ async function listPage(engine: DashboardEngine, url: URL, chrome: { limit: numb
 
   const next = page.cursor === null ? "" : nextPageLink(url, page.cursor);
 
-  return document(chrome.title, [
-    heading(chrome.title, url),
-    filters(url, { workflow, status, tag }),
-    rows.length === 0
-      ? `<p class="dim">No runs match.</p>`
-      : `<table>
+  return document(
+    chrome.title,
+    [
+      heading(chrome.title, url),
+      filters(url, { workflow, status, tag }),
+      rows.length === 0
+        ? `<p class="dim">No runs match.</p>`
+        : `<table>
           <thead><tr><th>run</th><th>workflow</th><th>status</th><th>started</th><th>duration</th><th>tags</th></tr></thead>
           <tbody>${rows.join("")}</tbody>
         </table>${next}`,
-  ]);
+    ],
+    chrome.refresh,
+  );
 }
 
 function filters(url: URL, current: { workflow: string; status: string; tag: string }): string {
@@ -540,7 +557,7 @@ function cancelForm(view: RunView, url: URL, csrfToken: string | null): string {
  * and that page is one click away, named in the facts. Keeping the only write
  * on one screen keeps the CSRF token on one screen.
  */
-function chainPage(view: ChainView, url: URL, title: string): string {
+function chainPage(view: ChainView, url: URL, title: string, refresh: number | null): string {
   const facts: [string, string][] = [
     ["workflow", text(view.workflow)],
     ["status", badge(view.status)],
@@ -575,19 +592,23 @@ function chainPage(view: ChainView, url: URL, title: string): string {
     </tr>`,
   );
 
-  return document(`${view.workflow} · ${view.root}`, [
-    `<p class="pager"><a href="${text(link(url))}">← all runs</a></p>`,
-    `<h1>${text(view.workflow)} <code class="dim">${text(view.root)}</code></h1>`,
-    `<dl>${facts.map(([k, v]) => `<dt>${text(k)}</dt><dd>${v}</dd>`).join("")}</dl>`,
-    section("Input", json(view.input)),
-    view.status === "completed" ? section("Output", json(view.output)) : "",
-    `<h2>Generations</h2><table>
+  return document(
+    `${view.workflow} · ${view.root}`,
+    [
+      `<p class="pager"><a href="${text(link(url))}">← all runs</a></p>`,
+      `<h1>${text(view.workflow)} <code class="dim">${text(view.root)}</code></h1>`,
+      `<dl>${facts.map(([k, v]) => `<dt>${text(k)}</dt><dd>${v}</dd>`).join("")}</dl>`,
+      section("Input", json(view.input)),
+      view.status === "completed" ? section("Output", json(view.output)) : "",
+      `<h2>Generations</h2><table>
       <thead><tr><th class="num">gen</th><th>run</th><th>status</th><th>started</th><th>duration</th></tr></thead>
       <tbody>${generations.join("")}</tbody>
     </table>`,
-    chainTimeline(view, events),
-    `<footer class="dim">${text(title)}</footer>`,
-  ]);
+      chainTimeline(view, events),
+      `<footer class="dim">${text(title)}</footer>`,
+    ],
+    refresh,
+  );
 }
 
 /**
@@ -662,13 +683,34 @@ function link(url: URL): string {
   return url.pathname;
 }
 
-function document(title: string, parts: string[]): string {
+/**
+ * The interval the mount asked the browser to re-read a screen on, or none.
+ *
+ * Whole seconds, because that is all the tag carries. Anything under one is
+ * read as off rather than clamped up to it: a typo in the seconds is the one
+ * way this option can hurt, and a mount that asked for `0` wanting no refresh
+ * must not get a reload every second instead — on a screen with no script to
+ * stop it.
+ */
+function refreshInterval(seconds: number | undefined): number | null {
+  if (seconds === undefined || !Number.isFinite(seconds)) return null;
+  const whole = Math.trunc(seconds);
+  return whole < 1 ? null : whole;
+}
+
+/**
+ * `refresh` is seconds, on the screens that only read. A browser re-requesting
+ * the URL it is already on is the whole mechanism: the same handler, the same
+ * document, no socket and no script — and `no-store` above is what makes it a
+ * re-read rather than a redraw of what the cache kept.
+ */
+function document(title: string, parts: string[], refresh: number | null = null): string {
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>${text(title)}</title>
+${refresh === null ? "" : `<meta http-equiv="refresh" content="${refresh}" />\n`}<title>${text(title)}</title>
 <style>${STYLE}</style>
 </head>
 <body>
