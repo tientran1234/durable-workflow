@@ -650,6 +650,26 @@ says so, next to the button. Throwing from `cancel` is how that layer refuses
 one operator what it allows another; the message comes back on the run page as
 their own mistakes do.
 
+A screen left open follows nothing by itself: each response is a document, so a
+run moving on is a refresh. `refreshSeconds` has the browser do that refresh,
+through a `<meta http-equiv="refresh">` and nothing else — no socket, no poll
+loop, no script, nothing to host beside it.
+
+```ts
+const admin = engine.dashboard({ refreshSeconds: 15 });   // the screen an incident is read through
+```
+
+It goes on the two screens that only read: the run list, with the filters and
+the page it is on intact because those are in the URL the browser asks for
+again, and a continuation chain while its live generation can still move. The
+run page is deliberately still. It carries the signal box, and a document that
+replaces itself takes the payload somebody is half-way through typing with it,
+so that screen stays the one an operator refreshes themselves. A chain that has
+ended, a run that is not there and a refused post carry no tag either — there is
+nothing on them left to re-read. The interval is whole seconds, and one under a
+second is read as off rather than clamped up to it: a reload every second is
+the one thing a screen with no script gives nobody a way to stop.
+
 ## Hooks
 
 `engine.list` and `engine.view` answer a question when you ask it. Hooks are the
@@ -1113,10 +1133,16 @@ CI runs the full suite, Postgres included, on every push.
   about to read back as what already happened. Both stay `Engine` calls, with
   consequences worth writing down at a call site rather than behind a button on
   a screen an incident is being read through.
-- **A dashboard that updates itself.** Each response is a document, so a run
-  moving on is a refresh. Live state means a socket or a poll loop, which means
-  scripts, which means the one thing this is not: something to build and host
-  before it is any use.
+- **A dashboard that updates part of itself, and a run page that reloads at
+  all.** `refreshSeconds` re-requests a whole screen — see Dashboard — which is
+  the only live state a document can have. Following one row, or a timeline that
+  grows without the page under it moving, means a socket or a poll loop over a
+  fragment, which means scripts, which means the one thing this is not:
+  something to build and host before it is any use. So a list that re-reads
+  itself loses nothing an operator gave it, its filters being in the URL, except
+  a word half-typed into the filter box — and the run page takes no tag at all,
+  because the box on that one holds a signal payload, and the work lost there is
+  the work they came to the screen to do.
 - **A wakeup for a lease that expired, and redelivery of one that was missed.**
   A worker that dies holding a run writes nothing, so nothing announces that
   the run is claimable again; the same is true of every notification sent while

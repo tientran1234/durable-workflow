@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-23
+
+- A screen that reloads itself: `dashboard(engine, { refreshSeconds })` writes a `<meta http-equiv="refresh">` into the two screens that only read, so a run list left open during an incident re-reads itself without a socket, a poll loop or a script — the tag goes on the list, where the filters and the page survive because they are in the URL the browser asks for again, and on a continuation chain while its live generation can still move, and is kept off the run page, where a document that replaced itself would take the signal payload an operator is half-way through typing with it, as well as off a chain that has ended, a run that is not there and a refused post, which have nothing left on them to re-read; the interval is the mount's in whole seconds, and one under a second is read as off rather than clamped up to it, because a reload every second is the one harm a screen with no script gives nobody a way to stop.
+
 ## 2026-10-17
 
 - Ending a run from the dashboard: `dashboard(engine, { cancel })` puts a Cancel run button on a run that is still going and refuses the post on a mount that was given no such call, so an operator who has decided a run will not finish ends it from the screen that shows them what it is stuck on instead of leaving the incident to reach for an engine — the call is handed over by the layer that owns the session and the decision rather than taken from `DashboardEngine`, which stays the three reads and the signal, and it is reached only past the same CSRF check the signal form posts behind, since the destructive post is the one a cross-site form would be written for; every post now goes through one door that reads the form and verifies the token once, a post with no action field is the signal it always was, both forms stand down on `TERMINAL`, and the form says what cancelling does not do, because compensations live inside a pass that replays the run's function and so none of them run.
