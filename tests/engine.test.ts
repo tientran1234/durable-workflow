@@ -1804,6 +1804,87 @@ describe("scheduled starts", () => {
     expect(view?.output).toBe("did rollup");
     expect(view?.timeline.map((e) => e.type)).toEqual(["step.completed"]);
   });
+
+  describe("on a calendar", () => {
+    // T0 is 2027-01-15T08:00:00Z, a Friday.
+    const iso = (ms: number) => new Date(ms).toISOString();
+
+    it("starts the run of the firing its expression put last", async () => {
+      const { engine, store } = harness([tick]);
+
+      const nine = await engine.schedule(tick, { job: "rollup" }, { cron: "0 9 * * *" });
+
+      // 09:00 is still an hour away, so the firing this call belongs to is
+      // yesterday's — the same reading an `every` grid gives a late call.
+      expect(iso(nine.periodStart)).toBe("2027-01-14T09:00:00.000Z");
+      expect(nine).toEqual({ runId: scheduleRunId("nightly", nine.periodStart), periodStart: nine.periodStart, created: true });
+      expect(store.all()).toHaveLength(1);
+    });
+
+    it("starts nothing again until the next firing comes round", async () => {
+      const { engine, store, advance } = harness([tick]);
+
+      const first = await engine.schedule(tick, { job: "rollup" }, { cron: "0 * * * *" });
+      advance(59 * 60_000);
+      const again = await engine.schedule(tick, { job: "rollup" }, { cron: "0 * * * *" });
+      advance(60_000);
+      const next = await engine.schedule(tick, { job: "rollup" }, { cron: "0 * * * *" });
+
+      expect(iso(first.periodStart)).toBe("2027-01-15T08:00:00.000Z");
+      expect(again).toEqual({ runId: first.runId, periodStart: first.periodStart, created: false });
+      expect(iso(next.periodStart)).toBe("2027-01-15T09:00:00.000Z");
+      expect(next.created).toBe(true);
+      expect(store.all()).toHaveLength(2);
+    });
+
+    it("fires on the day the calendar says and not on the days between", async () => {
+      // The last Friday of the month, which no period expressed in milliseconds
+      // lands on twice running.
+      const { engine, advance } = harness([tick]);
+
+      const first = await engine.schedule(tick, { job: "rollup" }, { cron: "0 17 * * 5L" });
+      advance(7 * 86_400_000);
+      const week = await engine.schedule(tick, { job: "rollup" }, { cron: "0 17 * * 5L" });
+
+      expect(iso(first.periodStart)).toBe("2026-12-25T17:00:00.000Z");
+      expect(week.periodStart).toBe(first.periodStart);
+      expect(week.created).toBe(false);
+    });
+
+    it("reads the expression in the zone it was written for", async () => {
+      const { engine } = harness([tick]);
+
+      const utc = await engine.schedule(tick, { job: "rollup" }, { cron: "0 9 * * *", name: "utc" });
+      const local = await engine.schedule(tick, { job: "rollup" }, { cron: "0 9 * * *", tz: "America/New_York", name: "local" });
+
+      // Nine in the morning in two places is two firings, and the run ids they
+      // derive keep them that far apart.
+      expect(iso(utc.periodStart)).toBe("2027-01-14T09:00:00.000Z");
+      expect(iso(local.periodStart)).toBe("2027-01-14T14:00:00.000Z");
+    });
+
+    it("starts one run between two processes that never agreed on a last tick", async () => {
+      const { engine, store, deploy } = harness([tick]);
+      const other = deploy([tick]);
+
+      const results = await Promise.all([
+        engine.schedule(tick, { job: "rollup" }, { cron: "0 9 * * *" }),
+        other.schedule(tick, { job: "rollup" }, { cron: "0 9 * * *" }),
+      ]);
+
+      expect(results.filter((r) => r.created)).toHaveLength(1);
+      expect(new Set(results.map((r) => r.runId)).size).toBe(1);
+      expect(store.all()).toHaveLength(1);
+    });
+
+    it("rejects an expression it cannot read, before writing anything", async () => {
+      const { engine, store } = harness([tick]);
+
+      await expect(engine.schedule(tick, { job: "rollup" }, { cron: "0 9 * *" })).rejects.toThrow(RangeError);
+      await expect(engine.schedule(tick, { job: "rollup" }, { cron: "0 9 * * *", tz: "Mars/Olympus" })).rejects.toThrow(RangeError);
+      expect(store.all()).toEqual([]);
+    });
+  });
 });
 
 describe("continuations", () => {

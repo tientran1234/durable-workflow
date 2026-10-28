@@ -16,7 +16,7 @@ import {
 import { type LifecycleHooks, notify, runEvent } from "./hooks.js";
 import { DEFAULT_RETRY } from "./retry.js";
 import { compensatedError, runCompensations } from "./saga.js";
-import { type ScheduleOptions, type ScheduledRun, schedulePeriod, scheduleRunId } from "./schedule.js";
+import { type ScheduleOptions, type ScheduledRun, schedulePeriodFor, scheduleRunId } from "./schedule.js";
 import { type SignalDefinition, SignalRegistry, recordRejection, signalName } from "./signals.js";
 import { normalizeTags, recordFormerTags, sameTags } from "./tags.js";
 import type { ChildHandle, RetryPolicy, RunPage, RunQuery, RunRecord, RunStore, WorkflowDefinition } from "./types.js";
@@ -140,7 +140,7 @@ export class Engine {
     input: Input,
     options: ScheduleOptions,
   ): Promise<ScheduledRun> {
-    const periodStart = schedulePeriod(this.now(), options.every);
+    const periodStart = schedulePeriodFor(this.now(), options);
     const name = options.name ?? (typeof workflow === "string" ? workflow : workflow.name);
     const runId = scheduleRunId(name, periodStart);
 

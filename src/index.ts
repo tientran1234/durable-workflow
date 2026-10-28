@@ -42,8 +42,11 @@ export type {
 export { chainRoot, continuationRunId, runGeneration } from "./continuation.js";
 
 // Scheduled starts: the period a call falls in and the run id that period takes.
-export { schedulePeriod, scheduleRunId } from "./schedule.js";
-export type { ScheduleOptions, ScheduledRun } from "./schedule.js";
+export { schedulePeriod, schedulePeriodFor, scheduleRunId } from "./schedule.js";
+export type { CronSchedule, EverySchedule, ScheduleOptions, ScheduledRun } from "./schedule.js";
+
+// Calendar schedules: the firing a cron expression names at or before a moment.
+export { CRON_LOOKBACK_DAYS, cronPrevious } from "./cron.js";
 
 // Typed signals: a name and the schema the engine checks payloads against.
 export { MAX_REJECTED_SIGNALS, defineSignal, signalName } from "./signals.js";
