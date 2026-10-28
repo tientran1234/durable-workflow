@@ -407,6 +407,37 @@ and `every: 86_400_000` is UTC midnight, on a worker that started yesterday and
 one that started a second ago. `name` separates two schedules over one
 workflow; without it they share the workflow's name, and therefore a run.
 
+A period off the epoch's grid cannot say *the first of the month*, *the last
+Friday* or *nine in the morning where the office is* — and the last of those is
+not even a fixed number of hours after the one before it. Pass `cron` in place
+of `every` and the period becomes the span between two firings of an
+expression:
+
+```ts
+await engine.schedule(rollup, input, { cron: "0 9 * * *", tz: "Europe/Lisbon" });
+await engine.schedule(invoices, input, { cron: "0 17 * * 5L" }); // the last Friday, at five
+```
+
+Five fields — `minute hour day-of-month month day-of-week` — with lists,
+ranges, steps and the usual three-letter names, cron's rule that a day matches
+*either* day field when both of them are restricted, and `L` for a month's last
+day or `5L` for its last Friday. `periodStart` comes back as the firing the call
+fell after rather than a boundary off the grid, and the run id is derived from it
+exactly as before, so the loop stays as disposable as it was: every worker, any
+frequency, nothing remembered about the last tick.
+
+`tz` is an IANA zone name and defaults to UTC. It is the zone the expression is
+written in, which is the only thing that makes `0 9 * * *` mean nine in the
+morning in March as well as in July — so the instant it names moves when the
+offset under it does. The two readings a zone makes awkward are settled here
+rather than left to whatever the clock does: an hour a spring-forward skips is a
+reading that day does not have, so the schedule misses that day instead of
+firing at some neighbouring hour nobody wrote down, and a reading a fall-back
+gives twice fires on the first of the two, the second falling inside a period
+whose run is already there. An expression no calendar satisfies — `0 0 30 2 *` —
+is a `RangeError` rather than a search with no end, and so is an unknown zone or
+a field this cannot read.
+
 A scheduled run is an ordinary run — it retries, waits for signals, and shows
 up in `engine.list` and `engine.view` — and the schedule does not wait for it.
 The next period starts a new run whether or not this one has finished. Where
@@ -1036,6 +1067,7 @@ src/
   signals.ts      a signal's name and schema in one value, and the refusals a run keeps
   hooks.ts        the lifecycle payloads, and the call that cannot fail a run
   schedule.ts     the period a clock reading falls in, and the id that period's run takes
+  cron.ts         the firing an expression names at or before a moment, read in its own zone
   continuation.ts a chain's root, a run's generation, and the id the next one takes
   stores/memory.ts
   stores/sqlite.ts     the same record on a file: one writer, so claiming is one statement
@@ -1054,6 +1086,10 @@ tests/
                         the chain a generation names, post the form, follow the
                         redirect — and a `<script>` tag carried in through an
                         id, a tag, an input and the query
+  cron.test.ts          12 tests on the arithmetic alone: the firing before a
+                        moment, either day field, a month's last Friday, a
+                        wall-clock hour held across an offset change, and the
+                        readings a zone skips or gives twice
   sqlite.test.ts        11 tests on a real file: a run resumed after the process
                         that started it is gone, stale writes, leases across two
                         connections, keyset paging, and the plan a tag query gets
@@ -1154,9 +1190,9 @@ CI runs the full suite, Postgres included, on every push.
 - **Durable hook delivery.** A lifecycle hook is an in-process call made after
   the write it reports; a worker that dies in between emits nothing, and nothing
   replays it. A side effect that must not be lost goes in the workflow as a step.
-- **Calling `engine.schedule` on time, and calendar schedules.** A schedule is
-  a fixed period measured from the epoch plus the run id derived from it; the
-  loop that calls it on time is still whatever you already run. What a period
-  cannot say, a cron expression can — the last weekday of a month, a local
-  timezone that observes DST — and that arithmetic stays on your side of
-  `every`.
+- **Calling `engine.schedule` on time.** A schedule is a period plus the run
+  id derived from it; the loop that calls it on time is still whatever you
+  already run. A period can now be a cron expression read in a zone — see
+  Schedules — so what it says on a calendar is no longer arithmetic left on
+  your side of `every`, but a firing nobody called during is still skipped
+  rather than backfilled, and nothing here wakes up to do the calling.
