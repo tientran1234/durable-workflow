@@ -444,10 +444,37 @@ The next period starts a new run whether or not this one has finished. Where
 two must not overlap, the workflow is what knows: start it with a step that
 checks.
 
-Nothing about the schedule itself is stored. The period's run *is* the record
-that the period fired, which is what a call reads to decide, so changing
-`every` or removing the schedule is a deploy rather than a migration — and a
-period nobody called during is skipped, not backfilled.
+A loop that stops calling leaves the periods it was down for empty, and the
+run a period derives is the only record that it fired, so nothing else is going
+to notice. `catchUp` widens a call from this period to the few behind it:
+
+```ts
+// Back from an outage: the hours nobody called for, then this one.
+const { runId, created, caughtUp } = await engine.schedule(rollup, input, { every: 3600_000, catchUp: 6 });
+// caughtUp: [{ runId, periodStart }, ...] — oldest first, and absent when none were missing.
+```
+
+Each of those periods is derived the way the current one is, so a call catching
+up computes the ids the calls that should have made them would have: a period
+that already has its run is read and left alone, and two workers back from one
+outage fill a period once between them without either knowing the other is
+filling it. They are started oldest first, so the runs exist in the order the
+periods ran, and `caughtUp` says which of them this call was the one to start.
+
+On a `cron` schedule the look-back counts firings, not hours: nine in the
+morning three days running is three periods and the days between them are not
+periods at all, and the firing before one across a spring-forward is the one
+the expression names in its zone rather than a fixed span back. The count is a
+whole number of periods up to `MAX_CATCH_UP`, read before anything is written,
+because each period reached is a read — and replaying a schedule from further
+back than that is an operator deciding to, with the ids derived the same way,
+rather than a tick catching up.
+
+Nothing about the schedule itself is stored for any of this. The period's run
+*is* the record that the period fired, which is what a call reads to decide —
+one period's run without `catchUp`, and a few more with it — so changing
+`every` or removing the schedule is a deploy rather than a migration, and a
+period nobody called during at all is skipped rather than backfilled.
 
 ## Inspecting runs
 
@@ -1192,7 +1219,12 @@ CI runs the full suite, Postgres included, on every push.
   replays it. A side effect that must not be lost goes in the workflow as a step.
 - **Calling `engine.schedule` on time.** A schedule is a period plus the run
   id derived from it; the loop that calls it on time is still whatever you
-  already run. A period can now be a cron expression read in a zone — see
-  Schedules — so what it says on a calendar is no longer arithmetic left on
-  your side of `every`, but a firing nobody called during is still skipped
-  rather than backfilled, and nothing here wakes up to do the calling.
+  already run. A period can now be a cron expression read in a zone, and a call
+  can ask for the periods behind it — see Schedules — so what the schedule says
+  on a calendar is no longer arithmetic left on your side of `every`, and a
+  worker that was down does not leave a hole where it was. What is still not
+  here is anything that wakes up: `catchUp` closes a gap on the next call, and
+  a deployment where no loop is calling at all has no next call, so it fires
+  nothing and there is nothing to catch up to. How far back one reaches is also
+  bounded, which makes the periods before that an operator's to start, by the
+  ids this derives.
