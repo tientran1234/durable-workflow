@@ -4,6 +4,7 @@ import {
   type ChildHandle,
   ConflictError,
   Engine,
+  MAX_CATCH_UP,
   MAX_FORMER_TAGS,
   MAX_REJECTED_SIGNALS,
   MAX_TAGS,
@@ -1791,6 +1792,147 @@ describe("scheduled starts", () => {
 
     await expect(engine.schedule(tick, { job: "rollup" }, { every: 0 })).rejects.toThrow(RangeError);
     await expect(engine.schedule(tick, { job: "rollup" }, { every: -1 })).rejects.toThrow(RangeError);
+  });
+
+  describe("catching up the periods nobody called during", () => {
+    it("starts the periods behind this one that have no run, oldest first", async () => {
+      // The gap a stopped worker leaves: three periods passed with nobody
+      // calling, and the loop comes back inside the fourth.
+      const { engine, store, advance } = harness([tick]);
+
+      advance(3 * 60_000);
+      const back = await engine.schedule(tick, { job: "rollup" }, { every: 60_000, catchUp: 3 });
+
+      expect(back.periodStart).toBe(T0 + 3 * 60_000);
+      expect(back.created).toBe(true);
+      expect(back.caughtUp).toEqual([
+        { runId: scheduleRunId("nightly", T0), periodStart: T0 },
+        { runId: scheduleRunId("nightly", T0 + 60_000), periodStart: T0 + 60_000 },
+        { runId: scheduleRunId("nightly", T0 + 2 * 60_000), periodStart: T0 + 2 * 60_000 },
+      ]);
+      expect(store.all()).toHaveLength(4);
+    });
+
+    it("reaches no further back than it was told to", async () => {
+      const { engine, store, advance } = harness([tick]);
+
+      advance(10 * 60_000);
+      const back = await engine.schedule(tick, { job: "rollup" }, { every: 60_000, catchUp: 2 });
+
+      expect(back.caughtUp?.map((p) => p.periodStart)).toEqual([T0 + 8 * 60_000, T0 + 9 * 60_000]);
+      expect(store.all()).toHaveLength(3);
+    });
+
+    it("says nothing on a loop that kept up, and starts nothing twice", async () => {
+      // The call a healthy loop makes: every period behind this one already has
+      // its run, so catching up is a read apiece and no write at all.
+      const { engine, store, advance } = harness([tick]);
+
+      await engine.schedule(tick, { job: "rollup" }, { every: 60_000, catchUp: 3 });
+      advance(60_000);
+      const next = await engine.schedule(tick, { job: "rollup" }, { every: 60_000, catchUp: 3 });
+
+      expect(next.created).toBe(true);
+      expect(next.caughtUp).toBeUndefined();
+      expect(store.all()).toHaveLength(2);
+    });
+
+    it("does not start a period again because its run has already finished", async () => {
+      // The run is the record that the period fired, whatever became of it, so
+      // a backfill must read the same answer a same-period call does.
+      const { engine, store, advance, drain } = harness([tick]);
+
+      await engine.schedule(tick, { job: "rollup" }, { every: 60_000 });
+      await drain();
+      advance(60_000);
+      const next = await engine.schedule(tick, { job: "rollup" }, { every: 60_000, catchUp: 1 });
+
+      expect(next.caughtUp).toBeUndefined();
+      expect(store.all().filter((r) => r.id === scheduleRunId("nightly", T0))).toHaveLength(1);
+      expect(store.all()).toHaveLength(2);
+    });
+
+    it("fills only the periods that are missing, leaving the ones that are not", async () => {
+      const { engine, store, advance } = harness([tick]);
+
+      await engine.schedule(tick, { job: "rollup" }, { every: 60_000 });
+      advance(3 * 60_000);
+      const back = await engine.schedule(tick, { job: "rollup" }, { every: 60_000, catchUp: 3 });
+
+      expect(back.caughtUp?.map((p) => p.periodStart)).toEqual([T0 + 60_000, T0 + 2 * 60_000]);
+      expect(store.all()).toHaveLength(4);
+    });
+
+    it("starts one run per period between two processes that catch up at once", async () => {
+      // Both workers came back from the same outage and neither knows the other
+      // is backfilling. The derived id is still the primary key.
+      const { engine, store, advance, deploy } = harness([tick]);
+      const other = deploy([tick]);
+
+      advance(3 * 60_000);
+      const results = await Promise.all([
+        engine.schedule(tick, { job: "rollup" }, { every: 60_000, catchUp: 3 }),
+        other.schedule(tick, { job: "rollup" }, { every: 60_000, catchUp: 3 }),
+      ]);
+
+      expect(store.all()).toHaveLength(4);
+      expect(results.flatMap((r) => r.caughtUp ?? []).length).toBe(3);
+    });
+
+    it("starts the runs it backfills as ordinary runs a worker then executes", async () => {
+      const { engine, advance, drain } = harness([tick]);
+
+      advance(2 * 60_000);
+      const back = await engine.schedule(tick, { job: "rollup" }, { every: 60_000, catchUp: 2 });
+      await drain();
+
+      const views = await Promise.all((back.caughtUp ?? []).map((p) => engine.view(p.runId)));
+      expect(views.map((v) => v?.status)).toEqual(["completed", "completed"]);
+      expect(views.map((v) => v?.output)).toEqual(["did rollup", "did rollup"]);
+    });
+
+    it("rejects a look-back that is not a whole number of periods within the cap", async () => {
+      const { engine, store } = harness([tick]);
+
+      await expect(engine.schedule(tick, { job: "rollup" }, { every: 60_000, catchUp: -1 })).rejects.toThrow(RangeError);
+      await expect(engine.schedule(tick, { job: "rollup" }, { every: 60_000, catchUp: 1.5 })).rejects.toThrow(RangeError);
+      await expect(
+        engine.schedule(tick, { job: "rollup" }, { every: 60_000, catchUp: MAX_CATCH_UP + 1 }),
+      ).rejects.toThrow(RangeError);
+      expect(store.all()).toEqual([]);
+    });
+
+    it("walks a calendar's firings back, not a span of milliseconds", async () => {
+      // Nine in the morning three days running is three firings; the days
+      // between them are not periods and have no run to be missing.
+      const { engine, store } = harness([tick]);
+      const iso = (ms: number) => new Date(ms).toISOString();
+
+      const back = await engine.schedule(tick, { job: "rollup" }, { cron: "0 9 * * *", catchUp: 2 });
+
+      expect(iso(back.periodStart)).toBe("2027-01-14T09:00:00.000Z");
+      expect((back.caughtUp ?? []).map((p) => iso(p.periodStart))).toEqual([
+        "2027-01-12T09:00:00.000Z",
+        "2027-01-13T09:00:00.000Z",
+      ]);
+      expect(store.all()).toHaveLength(3);
+    });
+
+    it("keeps a backfilled firing in the zone the expression was written in", async () => {
+      // The firing before nine in the morning is the day before's nine in the
+      // morning, which is a different number of hours back across a transition.
+      const { engine } = harness([tick]);
+      const iso = (ms: number) => new Date(ms).toISOString();
+
+      const back = await engine.schedule(
+        tick,
+        { job: "rollup" },
+        { cron: "0 9 * * *", tz: "America/New_York", catchUp: 1 },
+      );
+
+      expect(iso(back.periodStart)).toBe("2027-01-14T14:00:00.000Z");
+      expect((back.caughtUp ?? []).map((p) => iso(p.periodStart))).toEqual(["2027-01-13T14:00:00.000Z"]);
+    });
   });
 
   it("starts an ordinary run: a worker picks it up and it replays like any other", async () => {

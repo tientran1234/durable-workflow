@@ -10,22 +10,40 @@
 import { cronPrevious } from "./cron.js";
 
 /**
- * Which schedule this is, when one workflow has more than one. Defaults to the
- * workflow's name. It is part of the run id, so two schedules over one workflow
- * share a period's run unless they are named apart.
+ * How many periods behind this one a single call will look back over. Bounded
+ * because each one it reaches is a read, and the gap this closes is a loop that
+ * was down for a while: replaying a schedule from further back than this is an
+ * operator deciding to, with the ids in hand, rather than a tick catching up.
+ *
+ * Sixty-four covers a nightly schedule down for two months and an hourly one
+ * down for two and a half days.
  */
-interface NamedSchedule {
+export const MAX_CATCH_UP = 64;
+
+/** What both kinds of schedule take, whatever a period is under them. */
+interface SharedSchedule {
+  /**
+   * Which schedule this is, when one workflow has more than one. Defaults to
+   * the workflow's name. It is part of the run id, so two schedules over one
+   * workflow share a period's run unless they are named apart.
+   */
   name?: string;
+  /**
+   * How many periods before this one to start if nothing has: the gap a worker
+   * that was down leaves behind. Defaults to none, which is the old behaviour —
+   * a period nobody called during stays skipped.
+   */
+  catchUp?: number;
 }
 
 /** A period off the epoch's grid: the same boundaries in every process. */
-export interface EverySchedule extends NamedSchedule {
+export interface EverySchedule extends SharedSchedule {
   /** The period, in milliseconds. */
   every: number;
 }
 
 /** A period a calendar decides: the first of a month, the last Friday, 9am local. */
-export interface CronSchedule extends NamedSchedule {
+export interface CronSchedule extends SharedSchedule {
   /** `minute hour day-of-month month day-of-week`, with `L` for a month's last. */
   cron: string;
   /** The zone the expression is written in, as an IANA name. Defaults to UTC. */
@@ -34,16 +52,26 @@ export interface CronSchedule extends NamedSchedule {
 
 export type ScheduleOptions = EverySchedule | CronSchedule;
 
-/** What a call to `engine.schedule` did, or found already done. */
-export interface ScheduledRun {
+/** A period, and the run whose id is derived from it. */
+export interface ScheduledPeriod {
   runId: string;
   /**
-   * The period this call belongs to: where it began on an `every` grid, and the
-   * firing the expression named at or before the call on a `cron` one.
+   * The period this is: where it began on an `every` grid, and the firing the
+   * expression named at or before the call on a `cron` one.
    */
   periodStart: number;
+}
+
+/** What a call to `engine.schedule` did, or found already done. */
+export interface ScheduledRun extends ScheduledPeriod {
   /** False when the period's run already existed: this call started nothing. */
   created: boolean;
+  /**
+   * The periods behind this one that `catchUp` reached and found empty, oldest
+   * first, now each holding a run this call started. Absent when it started
+   * none, which is every call a loop that kept up makes.
+   */
+  caughtUp?: readonly ScheduledPeriod[];
 }
 
 /**
