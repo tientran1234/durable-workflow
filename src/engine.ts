@@ -16,7 +16,15 @@ import {
 import { type LifecycleHooks, notify, runEvent } from "./hooks.js";
 import { DEFAULT_RETRY } from "./retry.js";
 import { compensatedError, runCompensations } from "./saga.js";
-import { type ScheduleOptions, type ScheduledRun, schedulePeriodFor, scheduleRunId } from "./schedule.js";
+import {
+  type ScheduleOptions,
+  type ScheduledPeriod,
+  type ScheduledRun,
+  catchUpCount,
+  previousPeriods,
+  schedulePeriodFor,
+  scheduleRunId,
+} from "./schedule.js";
 import { type SignalDefinition, SignalRegistry, recordRejection, signalName } from "./signals.js";
 import { normalizeTags, recordFormerTags, sameTags } from "./tags.js";
 import type { ChildHandle, RetryPolicy, RunPage, RunQuery, RunRecord, RunStore, WorkflowDefinition } from "./types.js";
@@ -134,6 +142,10 @@ export class Engine {
    * Call it from whatever loop you already have, as often as you like and in
    * as many processes as you like: the run id is derived from the schedule and
    * the period, so the period starts one run however many calls it takes.
+   *
+   * `catchUp` widens that from this period to the few behind it, which is the
+   * gap a loop that stopped calling leaves: the periods it was down for have
+   * no run, and nothing else is going to notice.
    */
   async schedule<Input>(
     workflow: WorkflowDefinition<Input, unknown> | string,
@@ -142,6 +154,29 @@ export class Engine {
   ): Promise<ScheduledRun> {
     const periodStart = schedulePeriodFor(this.now(), options);
     const name = options.name ?? (typeof workflow === "string" ? workflow : workflow.name);
+    const missed = previousPeriods(periodStart, catchUpCount(options), options);
+
+    // Oldest first, and this period last, so the runs are created in the order
+    // the periods ran. A backfill that fails part way has started the periods
+    // it reached and no others, which the next call finishes: every one of
+    // these writes is the same idempotent write a call inside the period makes.
+    const caughtUp: ScheduledPeriod[] = [];
+    for (const period of missed) {
+      const run = await this.startPeriod(workflow, input, name, period);
+      if (run.created) caughtUp.push({ runId: run.runId, periodStart: period });
+    }
+
+    const run = await this.startPeriod(workflow, input, name, periodStart);
+    return { ...run, ...(caughtUp.length ? { caughtUp } : {}) };
+  }
+
+  /** One period's run, started unless some other call got there first. */
+  private async startPeriod<Input>(
+    workflow: WorkflowDefinition<Input, unknown> | string,
+    input: Input,
+    name: string,
+    periodStart: number,
+  ): Promise<ScheduledRun> {
     const runId = scheduleRunId(name, periodStart);
 
     if (await this.store.get(runId)) return { runId, periodStart, created: false };

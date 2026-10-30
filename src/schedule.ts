@@ -96,6 +96,42 @@ export function schedulePeriodFor(now: number, options: ScheduleOptions): number
   return "cron" in options ? cronPrevious(now, options.cron, options.tz) : schedulePeriod(now, options.every);
 }
 
+/**
+ * How many periods behind this one the call was told to look back over.
+ *
+ * Read and checked before anything is written, so a look-back this cannot
+ * honour fails the call rather than the half of it that is left.
+ */
+export function catchUpCount(options: ScheduleOptions): number {
+  const count = options.catchUp ?? 0;
+  if (!Number.isInteger(count) || count < 0 || count > MAX_CATCH_UP) {
+    throw new RangeError(`schedule "catchUp" must be a whole number of periods between 0 and ${MAX_CATCH_UP}, got ${options.catchUp}`);
+  }
+  return count;
+}
+
+/**
+ * The `count` periods before `periodStart`, oldest first.
+ *
+ * Each is derived from the schedule and a moment exactly as the current period
+ * is, so a call catching up computes the ids the calls that should have made
+ * them would have — which is the whole of why a backfill can be idempotent
+ * without a schedule remembering anything.
+ *
+ * Stepping back a millisecond is what crosses a boundary: a grid period's start
+ * and a firing both land on a whole minute, so the instant before one is inside
+ * the period before it, whatever a calendar says the gap between them is.
+ */
+export function previousPeriods(periodStart: number, count: number, options: ScheduleOptions): number[] {
+  const periods: number[] = [];
+  let at = periodStart;
+  for (let back = 0; back < count; back++) {
+    at = schedulePeriodFor(at - 1, options);
+    periods.push(at);
+  }
+  return periods.reverse();
+}
+
 /** The id a period's run takes. Its uniqueness is what makes the period fire once. */
 export function scheduleRunId(name: string, periodStart: number): string {
   return `${name}@${periodStart}`;

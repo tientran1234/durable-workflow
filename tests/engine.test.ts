@@ -1828,13 +1828,14 @@ describe("scheduled starts", () => {
       // its run, so catching up is a read apiece and no write at all.
       const { engine, store, advance } = harness([tick]);
 
-      await engine.schedule(tick, { job: "rollup" }, { every: 60_000, catchUp: 3 });
+      const first = await engine.schedule(tick, { job: "rollup" }, { every: 60_000, catchUp: 3 });
       advance(60_000);
       const next = await engine.schedule(tick, { job: "rollup" }, { every: 60_000, catchUp: 3 });
 
+      expect(first.caughtUp).toHaveLength(3);
       expect(next.created).toBe(true);
       expect(next.caughtUp).toBeUndefined();
-      expect(store.all()).toHaveLength(2);
+      expect(store.all()).toHaveLength(5);
     });
 
     it("does not start a period again because its run has already finished", async () => {
