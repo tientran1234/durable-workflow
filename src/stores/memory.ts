@@ -2,6 +2,7 @@ import { isDue } from "../due.js";
 import { afterCursor, byNewest, decodeCursor, encodeCursor, pageLimit } from "../list.js";
 import { hasTag, queryTags } from "../tags.js";
 import type { RunPage, RunQuery, RunRecord, RunStore } from "../types.js";
+import { queryVersion, runVersion } from "../versions.js";
 
 /** In-process store. Every read returns a copy, so callers cannot bypass save(). */
 export class MemoryStore implements RunStore {
@@ -50,9 +51,11 @@ export class MemoryStore implements RunStore {
     const limit = pageLimit(query.limit);
     const cursor = query.cursor === undefined ? null : decodeCursor(query.cursor);
     const tags = queryTags(query.tag);
+    const version = queryVersion(query.version);
     const matched = [...this.runs.values()]
       .filter((r) => query.workflow === undefined || r.workflow === query.workflow)
       .filter((r) => query.status === undefined || r.status === query.status)
+      .filter((r) => version === undefined || runVersion(r) === version)
       // Nothing is indexed in a Map, so a tag here is the scan the durable
       // stores exist to avoid; the answer is the same either way.
       .filter((r) => tags.every((tag) => hasTag(r, tag)))

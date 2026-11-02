@@ -173,6 +173,31 @@ describe("SqliteStore", () => {
     expect((await engine.list({ tag: "tenant:acme", version: 1 })).runs.map((r) => r.id)).toEqual(["r3", "r2", "r1"]);
     expect((await engine.list({ tag: "tenant:acme", version: 2 })).runs.map((r) => r.id)).toEqual(["r4"]);
     expect((await engine.list({ tag: "tenant:acme", version: 3 })).runs).toEqual([]);
+
+    // The pin is a predicate on rows the tag index has already put in order,
+    // not a second way into the table: the seek and the order still come from
+    // one index, so narrowing by it does not turn a page into a sort.
+    const prepare = db.prepare.bind(db);
+    let sql: string | null = null;
+    db.prepare = ((text: string) => {
+      if (text.includes("workflow_runs_tags")) sql = text;
+      return prepare(text);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    }) as any;
+    await engine.list({ tag: "tenant:acme", version: 1 });
+    db.prepare = prepare;
+
+    const plan = (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all({
+      tag: "tenant:acme",
+      workflow: null,
+      status: null,
+      version: 1,
+      createdAt: null,
+      id: null,
+      limit: 51,
+    }) as { detail: string }[]).map((p) => p.detail);
+    expect(plan.join("\n")).toMatch(/SEARCH t USING COVERING INDEX workflow_runs_tags_recent \(tag=\?\)/);
+    expect(plan.join("\n")).not.toMatch(/TEMP B-TREE/);
   });
 
   it("finds a tagged run from another connection, and pages a tag query", async () => {
@@ -216,6 +241,7 @@ describe("SqliteStore", () => {
       tag: "order:1",
       workflow: null,
       status: null,
+      version: null,
       createdAt: null,
       id: null,
       limit: 51,
@@ -253,6 +279,7 @@ describe("SqliteStore", () => {
       rest: JSON.stringify(["tenant:acme"]),
       workflow: null,
       status: null,
+      version: null,
       createdAt: null,
       id: null,
       limit: 51,

@@ -2,6 +2,7 @@ import type { Database } from "better-sqlite3";
 import { decodeCursor, encodeCursor, pageLimit } from "../list.js";
 import { queryTags } from "../tags.js";
 import type { RunPage, RunQuery, RunRecord, RunStore } from "../types.js";
+import { DEFAULT_VERSION, queryVersion } from "../versions.js";
 
 interface Row {
   data: string;
@@ -194,9 +195,18 @@ export class SqliteStore implements RunStore {
         : `AND (SELECT count(*) FROM ${this.tagTable} o
                  WHERE o.run_id = t.run_id
                    AND o.tag IN (SELECT value FROM json_each(@rest))) = json_array_length(@rest)`;
+    // The pin read off the record, for the reason the Postgres store reads it
+    // there rather than from a column: it is an admin screen's question, not
+    // the claim path's, and a column added now is one `ensureSchema` cannot
+    // put on a file that already has the table. The COALESCE is `runVersion`
+    // spelled in SQL, so a record written before versions existed is
+    // version 1 here too.
+    const pinnedTo = (data: string): string =>
+      `(@version IS NULL OR COALESCE(json_extract(${data}, '$.workflowVersion'), ${DEFAULT_VERSION}) = @version)`;
     const filters = {
       workflow: query.workflow ?? null,
       status: query.status ?? null,
+      version: queryVersion(query.version) ?? null,
       createdAt: cursor?.createdAt ?? null,
       id: cursor?.id ?? null,
       limit: limit + 1,
@@ -209,6 +219,7 @@ export class SqliteStore implements RunStore {
               `SELECT data, status, wake_at, lease_until, version FROM ${this.table}
                 WHERE (@workflow IS NULL OR workflow = @workflow)
                   AND (@status IS NULL OR status = @status)
+                  AND ${pinnedTo("data")}
                   AND (@createdAt IS NULL OR (created_at, id) < (@createdAt, @id))
                 ORDER BY created_at DESC, id DESC
                 LIMIT @limit`,
@@ -224,6 +235,7 @@ export class SqliteStore implements RunStore {
                 WHERE t.tag = @tag
                   AND (@workflow IS NULL OR r.workflow = @workflow)
                   AND (@status IS NULL OR r.status = @status)
+                  AND ${pinnedTo("r.data")}
                   AND (@createdAt IS NULL OR (t.created_at, t.run_id) < (@createdAt, @id))
                   ${carriesRest}
                 ORDER BY t.created_at DESC, t.run_id DESC

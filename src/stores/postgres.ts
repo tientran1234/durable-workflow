@@ -2,6 +2,7 @@ import type { Notification, Pool, PoolClient } from "pg";
 import { decodeCursor, encodeCursor, pageLimit } from "../list.js";
 import { queryTags } from "../tags.js";
 import type { RunPage, RunQuery, RunRecord, RunStore } from "../types.js";
+import { DEFAULT_VERSION, queryVersion } from "../versions.js";
 import { type Wakeup, type WakeupSource, type WakeupSubscription, decodeWakeup, encodeWakeup, wakeupFor } from "../wakeups.js";
 
 interface Row {
@@ -236,10 +237,20 @@ export class PostgresStore implements RunStore, WakeupSource {
       rest.length === 0
         ? ""
         : `AND (SELECT count(*) FROM ${this.tagTable} o
-                 WHERE o.run_id = t.run_id AND o.tag = ANY($7::text[])) = cardinality($7::text[])`;
+                 WHERE o.run_id = t.run_id AND o.tag = ANY($8::text[])) = cardinality($8::text[])`;
+    // The pin comes out of the record rather than a column of its own. It is
+    // asked about on an admin screen, never on the claim path the mirrored
+    // columns exist for, and it is the one field on a run that cannot change
+    // after create — so the cost of mirroring it is a column and an index on
+    // every write, plus the one thing `ensureSchema` cannot do to a table
+    // already out there: add it and backfill it. `COALESCE` to
+    // DEFAULT_VERSION is `runVersion` spelled in SQL, so a record written
+    // before versions existed answers here as it does everywhere else.
+    const pinnedTo = `($3::int IS NULL OR COALESCE((r.data->>'workflowVersion')::int, ${DEFAULT_VERSION}) = $3)`;
     const filters = [
       query.workflow ?? null,
       query.status ?? null,
+      queryVersion(query.version) ?? null,
       cursor?.createdAt ?? null,
       cursor?.id ?? null,
       limit + 1,
@@ -250,9 +261,10 @@ export class PostgresStore implements RunStore, WakeupSource {
             `SELECT r.data, r.status, r.wake_at, r.lease_until, r.version FROM ${this.table} r
               WHERE ($1::text IS NULL OR r.workflow = $1)
                 AND ($2::text IS NULL OR r.status = $2)
-                AND ($3::bigint IS NULL OR (r.created_at, r.id) < ($3::bigint, $4::text))
+                AND ${pinnedTo}
+                AND ($4::bigint IS NULL OR (r.created_at, r.id) < ($4::bigint, $5::text))
               ORDER BY r.created_at DESC, r.id DESC
-              LIMIT $5`,
+              LIMIT $6`,
             filters,
           )
         : await this.pool.query<Row>(
@@ -261,13 +273,14 @@ export class PostgresStore implements RunStore, WakeupSource {
             `SELECT r.data, r.status, r.wake_at, r.lease_until, r.version
                FROM ${this.tagTable} t
                JOIN ${this.table} r ON r.id = t.run_id
-              WHERE t.tag = $6
+              WHERE t.tag = $7
                 AND ($1::text IS NULL OR r.workflow = $1)
                 AND ($2::text IS NULL OR r.status = $2)
-                AND ($3::bigint IS NULL OR (t.created_at, t.run_id) < ($3::bigint, $4::text))
+                AND ${pinnedTo}
+                AND ($4::bigint IS NULL OR (t.created_at, t.run_id) < ($4::bigint, $5::text))
                 ${carriesRest}
               ORDER BY t.created_at DESC, t.run_id DESC
-              LIMIT $5`,
+              LIMIT $6`,
             rest.length === 0 ? [...filters, tag] : [...filters, tag, rest],
           );
     // One extra row tells us whether a next page exists without a second query.
