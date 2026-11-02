@@ -354,13 +354,32 @@ the version of the definition you hand it, `engine.start("fulfilment", input)`
 on the highest registered — so the default is the newest and pinning a run to
 an older version is deliberate.
 
-Keep the old definition registered until its runs drain. `engine.list` and
-`engine.view` report `workflowVersion`, which is how you tell when that is:
+Keep the old definition registered until its runs drain. Asking the store which
+runs are still on it is how you tell when that is:
 
 ```ts
-const { runs } = await engine.list({ workflow: "fulfilment", status: "waiting" });
-const stragglers = runs.filter((run) => runVersion(run) === 1);
+// Is anything still replaying v1? One page of one run per status it could be
+// sitting in — a listing is every run a version has, finished ones included,
+// and what decides the deploy is the ones that have not finished.
+const draining = [];
+for (const status of ["running", "sleeping", "waiting"] as const) {
+  const { runs } = await engine.list({ workflow: "fulfilment", version: 1, status, limit: 1 });
+  draining.push(...runs);
+}
+if (draining.length === 0) {
+  // Nothing is on v1 any more: the definition can come out of the deploy.
+}
 ```
+
+`version` narrows the listing the way `workflow` and `status` do, which is what
+makes an empty page mean none rather than none on this page: a page of runs
+filtered by hand afterwards says nothing about the stragglers behind its cursor.
+It reads each run's own pin, so a record written before versions existed answers
+to 1, the version it replays on; `engine.list` and `engine.view` also report
+`workflowVersion` on every run, and `runVersion(run)` applies that same default
+to a record you are already holding. A version that is not a whole number from 1
+is refused rather than answered with no runs, because no runs is the answer this
+is read for.
 
 A version is one registration, not a label: registering the same name twice at
 one version throws at startup, because two bodies under one version are
@@ -1140,7 +1159,12 @@ CI runs the full suite, Postgres included, on every push.
 
 - **Migrating an in-flight run between versions.** A run finishes on the
   version it started on; there is no hook to rewrite its history onto the next
-  one. Keep the old definition registered until those runs drain.
+  one. Which runs are still holding a version is now a question a listing
+  answers — `list({ version })`, see Versions — but moving one across is not:
+  a run's history is what already happened, and replaying it onto code that
+  never ran means handing a step a result some other function recorded. Keep
+  the old definition registered until those runs drain, which is the thing the
+  listing is for.
 - **A chain on the run list.** The dashboard reads one — see Dashboard — but
   `engine.list` and the page of rows over it are still runs: a chain of nine
   generations is nine rows there, and the chain is a link on one of them rather
