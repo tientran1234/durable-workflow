@@ -17,6 +17,25 @@ export function runVersion(run: Pick<RunRecord, "workflowVersion">): number {
 }
 
 /**
+ * The version a `list({ version })` query means, checked where every store
+ * reads it — the way each of them calls `pageLimit` and `queryTags` — so one
+ * spelling of the question cannot be answered differently depending on which
+ * store is holding the runs.
+ *
+ * A version is a registration rather than a label, so a query has to name one
+ * a run could have started on: a fraction, a zero or a NaN names no
+ * definition, and answering it with no runs would read as "the runs on that
+ * version have drained", which is the one answer this must not invent.
+ */
+export function queryVersion(version: number | undefined): number | undefined {
+  if (version === undefined) return undefined;
+  if (!Number.isInteger(version) || version < DEFAULT_VERSION) {
+    throw new Error(`a version query names a whole version from ${DEFAULT_VERSION}, got ${version}`);
+  }
+  return version;
+}
+
+/**
  * The workflows an engine knows, keyed by name *and* version, so several
  * versions of one name live here side by side. That is what lets a deploy add
  * v2 without touching runs that started on v1: a run replays on the version it

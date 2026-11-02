@@ -402,6 +402,58 @@ describe("workflow versions", () => {
     expect((await engine.get(id))?.history[0]).toMatchObject({ name: "load" });
   });
 
+  it("lists the runs a version still has, and pages them", async () => {
+    const { engine } = harness([v1, v2]);
+    for (const id of ["old-1", "old-2", "old-3"]) await engine.start(v1, null, { id });
+    await engine.start(v2, null, { id: "new-1" });
+
+    expect((await engine.list({ workflow: "greet", version: 2 })).runs.map((r) => r.id)).toEqual(["new-1"]);
+    // The store narrows, so the page is a page of matches: three of the four
+    // runs are v1, which is two pages of two rather than one page of two with
+    // the v2 run filtered out of it afterwards.
+    const first = await engine.list({ version: 1, limit: 2 });
+    expect(first.runs.map((r) => r.id)).toEqual(["old-3", "old-2"]);
+    const second = await engine.list({ version: 1, limit: 2, cursor: first.cursor ?? "" });
+    expect(second.runs.map((r) => r.id)).toEqual(["old-1"]);
+    expect(second.cursor).toBeNull();
+    expect((await engine.list({ version: 3 })).runs).toEqual([]);
+  });
+
+  it("narrows by version alongside a status and a tag", async () => {
+    const { engine } = harness([v1, v2]);
+    await engine.start(v1, null, { id: "old-1", tags: ["tenant:acme"] });
+    const waiting = await engine.start(v1, null, { id: "old-2", tags: ["tenant:acme"] });
+    await engine.start(v2, null, { id: "new-1", tags: ["tenant:acme"] });
+    await engine.settle(waiting); // waiting on "go", so the status tells it apart
+
+    const tagged = { tag: "tenant:acme" } as const;
+    expect((await engine.list({ ...tagged, version: 1 })).runs.map((r) => r.id)).toEqual(["old-2", "old-1"]);
+    expect((await engine.list({ ...tagged, version: 1, status: "waiting" })).runs.map((r) => r.id)).toEqual(["old-2"]);
+    expect((await engine.list({ ...tagged, version: 2, status: "waiting" })).runs).toEqual([]);
+  });
+
+  it("counts a run recorded before versions existed among version 1's", async () => {
+    const { engine, store } = harness([v1, v2]);
+    const id = await engine.start(v1, null);
+
+    const legacy = (await store.get(id))!;
+    delete legacy.workflowVersion;
+    await store.save(legacy, legacy.version);
+
+    expect((await engine.list({ version: 1 })).runs.map((r) => r.id)).toEqual([id]);
+    expect((await engine.list({ version: 2 })).runs).toEqual([]);
+  });
+
+  it("refuses a version query that names no registration a run could hold", async () => {
+    const { engine } = harness([v1, v2]);
+
+    // Answering any of these with an empty page would say the runs on that
+    // version have drained, which is the one thing an operator reads this for.
+    await expect(engine.list({ version: 0 })).rejects.toThrow(/whole version from 1, got 0/);
+    await expect(engine.list({ version: 1.5 })).rejects.toThrow(/whole version from 1/);
+    await expect(engine.list({ version: Number.NaN })).rejects.toThrow(/whole version from 1/);
+  });
+
   describe("children", () => {
     const emitV1 = defineWorkflow<null, string>("emit", async (ctx) => ctx.step("emit", () => "from v1"));
     const emitV2 = defineWorkflow<null, string>("emit", async (ctx) => ctx.step("emit", () => "from v2"), {

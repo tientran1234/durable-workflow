@@ -298,6 +298,12 @@ export interface RunQuery {
   workflow?: string;
   status?: RunStatus;
   /**
+   * Runs pinned to this workflow version: `defineWorkflow`'s `version`, not a
+   * record's own write `version`. A run recorded before versions existed
+   * carries no pin and answers to 1, the way `runVersion` reads one.
+   */
+  version?: number;
+  /**
    * Runs carrying this tag — or, given a set, every tag in it. Matched whole
    * and exactly, after trimming.
    */

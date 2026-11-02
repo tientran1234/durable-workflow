@@ -23,8 +23,9 @@ export type {
   WorkflowOptions,
 } from "./types.js";
 
-// A run replays on the version it started on; these read that pin back.
-export { DEFAULT_VERSION, runVersion } from "./versions.js";
+// A run replays on the version it started on; these read that pin back, and
+// the last is the pin a listing asks for, checked the same way in every store.
+export { DEFAULT_VERSION, queryVersion, runVersion } from "./versions.js";
 
 // Compaction folds a run's settled history so replay stops scanning all of it.
 export { DEFAULT_COMPACT_AFTER, compactHistory, historyEvents, nextSeq, settledPrefix } from "./compaction.js";

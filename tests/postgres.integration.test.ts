@@ -115,6 +115,31 @@ describe.skipIf(!url)("PostgresStore", () => {
     expect((await engine.list({ workflow: "nope" })).runs).toEqual([]);
   });
 
+  it("lists the runs pinned to one version, and narrows a tag query by it", async () => {
+    // A v2 of the same name, as the deploy that left v1's runs in the store.
+    const v2 = defineWorkflow<{ n: number }, number>(
+      "pg-sum",
+      async (ctx, input) => ctx.step("double", () => input.n * 2),
+      { version: 2 },
+    );
+    const engine = new Engine({ store, workflows: [wf, v2], now: () => T0 });
+    for (const id of ["r1", "r2", "r3"]) await engine.start(wf, { n: 1 }, { id, tags: ["tenant:acme"] });
+    await engine.start(v2, { n: 1 }, { id: "r4", tags: ["tenant:acme"] });
+
+    const first = await engine.list({ version: 1, limit: 2 });
+    expect(first.runs.map((r) => r.id)).toEqual(["r3", "r2"]);
+    const second = await engine.list({ version: 1, limit: 2, cursor: first.cursor ?? "" });
+    expect(second.runs.map((r) => r.id)).toEqual(["r1"]);
+    expect(second.cursor).toBeNull();
+    expect((await engine.list({ version: 2 })).runs.map((r) => r.id)).toEqual(["r4"]);
+
+    // The other branch of the same listing: the tag index names the candidates
+    // and the pin still narrows them.
+    expect((await engine.list({ tag: "tenant:acme", version: 1 })).runs.map((r) => r.id)).toEqual(["r3", "r2", "r1"]);
+    expect((await engine.list({ tag: "tenant:acme", version: 2 })).runs.map((r) => r.id)).toEqual(["r4"]);
+    expect((await engine.list({ tag: "tenant:acme", version: 3 })).runs).toEqual([]);
+  });
+
   it("finds tagged runs and pages a tag query with an exact cursor", async () => {
     const engine = new Engine({ store, workflows: [wf], now: () => T0 });
     for (const id of ["r1", "r2", "r3"]) await engine.start(wf, { n: 1 }, { id, tags: ["tenant:acme"] });
